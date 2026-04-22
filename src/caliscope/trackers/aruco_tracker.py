@@ -17,7 +17,7 @@ import numpy as np
 
 from caliscope.core.aruco_target import ArucoTarget
 from caliscope.packets import PointPacket
-from caliscope.tracker import Tracker
+from caliscope.tracker import Segment, Tracker, WireFrameView
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,8 @@ CORNER_TL = 0  # Top-left
 CORNER_TR = 1  # Top-right
 CORNER_BR = 2  # Bottom-right
 CORNER_BL = 3  # Bottom-left
+CORNER_NAMES = ("tl", "tr", "br", "bl")
+WIREFRAME_COLORS = ("g", "c", "y", "m", "r", "b")
 
 
 class ArucoTracker(Tracker):
@@ -182,8 +184,18 @@ class ArucoTracker(Tracker):
         )
 
     def get_point_name(self, point_id: int) -> str:
-        """Minimal implementation: return point ID as string."""
-        return str(point_id)
+        """Return a stable name for a tracked ArUco corner."""
+        if self.aruco_target is None:
+            return str(point_id)
+
+        marker_id = point_id // 10
+        corner_index = point_id % 10
+
+        if corner_index < 0 or corner_index >= len(CORNER_NAMES):
+            return str(point_id)
+
+        marker_label = self.aruco_target.get_marker_label(marker_id)
+        return f"{marker_label}_{CORNER_NAMES[corner_index]}"
 
     def scatter_draw_instructions(self, point_id: int) -> dict:
         """
@@ -195,3 +207,59 @@ class ArucoTracker(Tracker):
             "color": (0, 255, 0),  # Green in BGR
             "thickness": -1,  # filled circle
         }
+
+    @property
+    def wireframe(self) -> WireFrameView | None:
+        """Marker-face wireframe for 3D visualization."""
+        if self.aruco_target is None:
+            return None
+
+        point_names: dict[str, int] = {}
+        segments: list[Segment] = []
+
+        for marker_index, marker_id in enumerate(self.aruco_target.ordered_marker_ids):
+            face_color = WIREFRAME_COLORS[marker_index % len(WIREFRAME_COLORS)]
+            corner_names = []
+
+            for corner_index, corner_name in enumerate(CORNER_NAMES):
+                point_name = self.get_point_name(marker_id * 10 + corner_index)
+                point_names[point_name] = marker_id * 10 + corner_index
+                corner_names.append(point_name)
+
+            for edge_index, (point_a, point_b) in enumerate(
+                (
+                    (corner_names[0], corner_names[1]),
+                    (corner_names[1], corner_names[2]),
+                    (corner_names[2], corner_names[3]),
+                    (corner_names[3], corner_names[0]),
+                )
+            ):
+                segments.append(
+                    Segment(
+                        name=f"{self.aruco_target.get_marker_label(marker_id)}_edge_{edge_index}",
+                        color=face_color,
+                        point_A=point_a,
+                        point_B=point_b,
+                    )
+                )
+
+        return WireFrameView(segments=tuple(segments), point_names=point_names)
+
+    def get_connected_points(self) -> set[tuple[int, int]]:
+        """Connect marker corners into face outlines for 2D/3D drawing."""
+        if self.aruco_target is None:
+            return set()
+
+        connected_points = set()
+        for marker_id in self.aruco_target.ordered_marker_ids:
+            base_id = marker_id * 10
+            connected_points.update(
+                {
+                    (base_id + CORNER_TL, base_id + CORNER_TR),
+                    (base_id + CORNER_TR, base_id + CORNER_BR),
+                    (base_id + CORNER_BR, base_id + CORNER_BL),
+                    (base_id + CORNER_BL, base_id + CORNER_TL),
+                }
+            )
+
+        return connected_points

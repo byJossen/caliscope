@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, Qt, Signal
+from PySide6.QtGui import QImage
 from PySide6.QtSvgWidgets import QSvgWidget
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -38,7 +39,7 @@ from PySide6.QtWidgets import (
 import cv2
 
 from caliscope.core.workflow_status import StepStatus, WorkflowStatus
-from caliscope.gui.utils.aruco_preview import render_aruco_pixmap
+from caliscope.gui.utils.aruco_preview import render_aruco_target_pixmap
 from caliscope.gui.utils.chessboard_preview import render_chessboard_pixmap
 from caliscope.gui.utils.charuco_preview import render_charuco_pixmap
 from caliscope.gui.widgets.aruco_target_config_panel import ArucoTargetConfigPanel
@@ -328,7 +329,8 @@ class ProjectSetupView(QWidget):
         type_row.addWidget(QLabel("Target Type:"))
         self._extrinsic_type_combo = QComboBox()
         self._extrinsic_type_combo.addItem("ChArUco Board", "charuco")
-        self._extrinsic_type_combo.addItem("ArUco Marker", "aruco")
+        self._extrinsic_type_combo.addItem("ArUco Marker", "aruco_marker")
+        self._extrinsic_type_combo.addItem("ArUco Cube", "aruco_cube")
         type_row.addWidget(self._extrinsic_type_combo)
         type_row.addStretch()
         main_layout.addLayout(type_row)
@@ -349,7 +351,10 @@ class ProjectSetupView(QWidget):
 
         self._extrinsic_aruco_preview = QLabel()
         self._extrinsic_aruco_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._extrinsic_aruco_preview.setMinimumSize(120, 120)
+        self._extrinsic_aruco_preview.setMinimumSize(220, 220)
+        self._extrinsic_aruco_preview.setStyleSheet(
+            "QLabel { background-color: #2a2a2a; border: 1px solid #555; border-radius: 4px; }"
+        )
         aruco_layout.addWidget(self._extrinsic_aruco_preview, stretch=1)
         self._extrinsic_stack.addWidget(aruco_page)
 
@@ -385,11 +390,10 @@ class ProjectSetupView(QWidget):
             self._same_as_intrinsic_check.setVisible(intrinsic_is_charuco)
             self._update_extrinsic_stack()
         else:
-            self._extrinsic_type_combo.setCurrentIndex(1)
+            combo_index = self._extrinsic_type_combo.findData(routing.extrinsic_target_type)
+            self._extrinsic_type_combo.setCurrentIndex(max(1, combo_index))
             self._same_as_intrinsic_check.setVisible(False)
-            self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_ARUCO)
-            self._extrinsic_save_btn.setText("Save PNG")
-            self._update_extrinsic_aruco_preview()
+            self._update_extrinsic_stack()
 
         return group
 
@@ -553,6 +557,9 @@ class ProjectSetupView(QWidget):
         intrinsic_is_charuco = routing.intrinsic_target_type == "charuco"
         self._same_as_intrinsic_check.setVisible(target_type == "charuco" and intrinsic_is_charuco)
 
+        if target_type in ("aruco_marker", "aruco_cube"):
+            self._sync_extrinsic_aruco_panel_to_target_type(target_type)
+
         self._update_extrinsic_stack()
 
     def _on_same_as_intrinsic_changed(self, checked: bool) -> None:
@@ -563,12 +570,12 @@ class ProjectSetupView(QWidget):
     def _update_extrinsic_stack(self) -> None:
         """Set the correct stacked widget page based on current state."""
         target_type = self._extrinsic_type_combo.currentData()
-        if target_type == "aruco":
+        if target_type in ("aruco_marker", "aruco_cube"):
+            self._sync_extrinsic_aruco_panel_to_target_type(target_type)
             self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_ARUCO)
-            self._extrinsic_save_btn.setText("Save PNG")
-            self._extrinsic_save_btn.setEnabled(True)
-            self._extrinsic_save_btn.setToolTip("")
+            self._extrinsic_save_btn.setText("Save PNG" if target_type == "aruco_marker" else "Save PNGs")
             self._update_extrinsic_aruco_preview()
+            self._refresh_extrinsic_aruco_actions()
         else:  # "charuco"
             same_as_intrinsic = self._same_as_intrinsic_check.isChecked()
             self._extrinsic_stack.setCurrentIndex(_EXTRINSIC_PAGE_CHARUCO)
@@ -597,7 +604,12 @@ class ProjectSetupView(QWidget):
         """Handle extrinsic ArUco config panel change."""
         if self._extrinsic_aruco_panel is None:
             return
-        target = self._extrinsic_aruco_panel.get_aruco_target()
+        self._refresh_extrinsic_aruco_actions()
+        try:
+            target = self._extrinsic_aruco_panel.get_aruco_target()
+        except ValueError as exc:
+            logger.info(f"Skipping invalid ArUco target update: {exc}")
+            return
         self._coordinator.update_extrinsic_aruco_target(target)
 
     def _on_extrinsic_charuco_changed(self) -> None:
@@ -610,7 +622,8 @@ class ProjectSetupView(QWidget):
     def _on_extrinsic_target_changed(self) -> None:
         """Refresh extrinsic preview."""
         target_type = self._coordinator.targets_repository.extrinsic_target_type
-        if target_type == "aruco":
+        if target_type in ("aruco_marker", "aruco_cube"):
+            self._sync_extrinsic_aruco_panel_to_target_type(target_type)
             self._update_extrinsic_aruco_preview()
         else:
             self._update_extrinsic_charuco_preview()
@@ -618,7 +631,7 @@ class ProjectSetupView(QWidget):
     def _save_extrinsic_target(self) -> None:
         """Save extrinsic target board image(s) to file."""
         target_type = self._coordinator.targets_repository.extrinsic_target_type
-        if target_type == "aruco":
+        if target_type in ("aruco_marker", "aruco_cube"):
             self._save_aruco_png(self._extrinsic_aruco_panel)
         else:
             self._save_charuco_images(self._extrinsic_charuco_panel)
@@ -648,9 +661,38 @@ class ProjectSetupView(QWidget):
     def _update_extrinsic_aruco_preview(self) -> None:
         """Update extrinsic ArUco preview."""
         target = self._coordinator.targets_repository.load_aruco_target()
-        marker_id = target.marker_ids[0] if target.marker_ids else 0
-        pixmap = render_aruco_pixmap(target, marker_id, 120)
+        pixmap = render_aruco_target_pixmap(target, 220)
         self._extrinsic_aruco_preview.setPixmap(pixmap)
+        self._extrinsic_save_btn.setText("Save PNGs" if len(target.ordered_marker_ids) > 1 else "Save PNG")
+
+    def _refresh_extrinsic_aruco_actions(self) -> None:
+        """Keep save/export controls aligned with the current ArUco panel validity."""
+        if self._extrinsic_aruco_panel is None:
+            return
+        error = self._extrinsic_aruco_panel.validation_error()
+        if error is None:
+            self._extrinsic_save_btn.setEnabled(True)
+            self._extrinsic_save_btn.setToolTip("")
+            return
+        self._extrinsic_save_btn.setEnabled(False)
+        self._extrinsic_save_btn.setToolTip(error)
+
+    def _sync_extrinsic_aruco_panel_to_target_type(self, target_type: str) -> None:
+        """Keep the shared ArUco panel aligned with the explicit extrinsic target choice."""
+        if self._extrinsic_aruco_panel is None:
+            return
+
+        layout = "cube" if target_type == "aruco_cube" else "single_marker"
+        self._extrinsic_aruco_panel.set_layout_mode(layout, lock=True)
+
+        try:
+            target = self._extrinsic_aruco_panel.get_aruco_target()
+        except ValueError:
+            self._refresh_extrinsic_aruco_actions()
+            return
+        stored_target = self._coordinator.targets_repository.load_aruco_target()
+        if stored_target.layout != target.layout:
+            self._coordinator.update_extrinsic_aruco_target(target)
 
     # -------------------------------------------------------------------------
     # File Save Handlers
@@ -692,12 +734,38 @@ class ProjectSetupView(QWidget):
             logger.info(f"Saved chessboard to {file_path}")
 
     def _save_aruco_png(self, panel: ArucoTargetConfigPanel | None) -> None:
-        """Save ArUco marker image to file."""
+        """Save ArUco marker image(s) to file."""
         if panel is None:
             return
-        target = panel.get_aruco_target()
-        marker_id = target.marker_ids[0] if target.marker_ids else 0
+        try:
+            target = panel.get_aruco_target()
+        except ValueError as exc:
+            logger.warning(f"Cannot export ArUco target with invalid settings: {exc}")
+            return
+        pixels_per_meter = 8000
 
+        if target.is_cube:
+            output_dir = QFileDialog.getExistingDirectory(
+                self,
+                "Save ArUco Target Faces",
+                str(Path(self._coordinator.workspace)),
+            )
+            if not output_dir:
+                return
+
+            output_path = Path(output_dir)
+            for face_name, bgr in target.generate_cube_face_sheet_images(pixels_per_meter=pixels_per_meter).items():
+                file_name = f"aruco_cube_{face_name}.png"
+                self._save_png_with_scale(output_path / file_name, bgr, pixels_per_meter)
+
+            layout_path = output_path / "aruco_cube_layout.png"
+            layout_bgr = target.generate_cube_layout_image(pixels_per_meter=pixels_per_meter)
+            self._save_png_with_scale(layout_path, layout_bgr, pixels_per_meter)
+
+            logger.info(f"Saved 6 ArUco cube face sheets and a cube layout image to {output_path}")
+            return
+
+        marker_id = target.ordered_marker_ids[0] if target.ordered_marker_ids else 0
         default_path = Path(self._coordinator.workspace) / f"aruco_marker_{marker_id}.png"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -707,10 +775,19 @@ class ProjectSetupView(QWidget):
         )
 
         if file_path:
-            # Generate high-resolution marker for printing
-            bgr = target.generate_marker_image(marker_id, pixels_per_meter=8000)
-            cv2.imwrite(file_path, bgr)
+            bgr = target.generate_marker_image(marker_id, pixels_per_meter=pixels_per_meter)
+            self._save_png_with_scale(Path(file_path), bgr, pixels_per_meter)
             logger.info(f"Saved ArUco marker to {file_path}")
+
+    def _save_png_with_scale(self, path: Path, bgr: cv2.typing.MatLike, pixels_per_meter: int) -> None:
+        """Save PNG with physical resolution metadata for true-size printing."""
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimage = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+        qimage.setDotsPerMeterX(pixels_per_meter)
+        qimage.setDotsPerMeterY(pixels_per_meter)
+        qimage.save(str(path), "PNG")
 
     # -------------------------------------------------------------------------
     # Other Handlers

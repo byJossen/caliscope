@@ -37,6 +37,7 @@ class LinkQuality(Enum):
 # Thresholds for link quality classification
 GOOD_OBSERVATION_THRESHOLD = 200
 MARGINAL_OBSERVATION_THRESHOLD = 50
+MIN_RIGID_TARGET_POINTS_PER_CAMERA = 4
 
 
 class WarningSeverity(Enum):
@@ -109,6 +110,9 @@ def compute_coverage_matrix(
     n_cameras = len(cam_id_to_index)
     coverage = np.zeros((n_cameras, n_cameras), dtype=np.int64)
 
+    if _uses_rigid_target_covisibility(df):
+        return _compute_rigid_target_covisibility_matrix(df, cam_id_to_index)
+
     # Group by (sync_index, point_id) to find which cameras see each point
     grouped = df.groupby(["sync_index", "point_id"])["cam_id"].apply(set)
 
@@ -122,6 +126,62 @@ def compute_coverage_matrix(
                     coverage[idx_i, idx_j] += 1
                     if idx_i != idx_j:
                         coverage[idx_j, idx_i] += 1
+
+    return coverage
+
+
+def _uses_rigid_target_covisibility(df) -> bool:
+    """Detect non-planar rigid targets, where same-sync visibility matters more than shared point IDs."""
+    if len(df) == 0:
+        return False
+
+    obj_cols = ["point_id", "obj_loc_x", "obj_loc_y", "obj_loc_z"]
+    if not all(col in df.columns for col in obj_cols):
+        return False
+
+    obj_points = df[obj_cols].dropna(subset=["obj_loc_x", "obj_loc_y", "obj_loc_z"]).drop_duplicates(subset=["point_id"])
+    if len(obj_points) < MIN_RIGID_TARGET_POINTS_PER_CAMERA:
+        return False
+
+    coords = obj_points[["obj_loc_x", "obj_loc_y", "obj_loc_z"]].to_numpy(dtype=np.float64)
+    centered = coords - coords.mean(axis=0, keepdims=True)
+    return np.linalg.matrix_rank(centered, tol=1e-6) > 2
+
+
+def _compute_rigid_target_covisibility_matrix(
+    df,
+    cam_id_to_index: dict[int, int],
+    min_points_per_camera: int = MIN_RIGID_TARGET_POINTS_PER_CAMERA,
+) -> NDArray[np.int64]:
+    """Count pairwise same-sync rigid-target visibility.
+
+    For non-planar rigid targets such as an ArUco cube, cameras do not need to
+    share the same point IDs. What matters is whether each camera saw enough
+    target corners in the same sync frame to contribute a valid pose estimate.
+    """
+    n_cameras = len(cam_id_to_index)
+    coverage = np.zeros((n_cameras, n_cameras), dtype=np.int64)
+
+    valid_rows = df.dropna(subset=["obj_loc_x", "obj_loc_y", "obj_loc_z"])
+    if len(valid_rows) == 0:
+        return coverage
+
+    grouped = valid_rows.groupby(["sync_index", "cam_id"]).size()
+    by_sync: dict[int, list[int]] = {}
+
+    for (sync_index, cam_id), point_count in grouped.items():
+        if point_count >= min_points_per_camera and cam_id in cam_id_to_index:
+            by_sync.setdefault(int(sync_index), []).append(int(cam_id))
+
+    for cam_ids in by_sync.values():
+        cam_id_list = sorted(set(cam_ids))
+        for i, cam_id_i in enumerate(cam_id_list):
+            idx_i = cam_id_to_index[cam_id_i]
+            coverage[idx_i, idx_i] += 1
+            for cam_id_j in cam_id_list[i + 1 :]:
+                idx_j = cam_id_to_index[cam_id_j]
+                coverage[idx_i, idx_j] += 1
+                coverage[idx_j, idx_i] += 1
 
     return coverage
 

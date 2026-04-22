@@ -11,6 +11,57 @@ WorldCoords = NDArray[np.float64]  # Shape: (n_observations, 3) or (n_points, 3)
 ErrorsXY = NDArray[np.float64]  # Shape: (n_observations, 2)
 
 
+def project_world_to_image(
+    camera_data,
+    world_coords: WorldCoords,
+    *,
+    rvec: NDArray[np.float64],
+    tvec: NDArray[np.float64],
+    use_normalized: bool = False,
+) -> NDArray[np.float64]:
+    """Project 3D world points with the correct lens model for the camera."""
+    if use_normalized:
+        cam_matrix = np.identity(3)
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+        projected, _ = cv2.projectPoints(
+            world_coords.reshape(-1, 1, 3),
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+            cam_matrix,
+            dist_coeffs,
+        )
+        return projected.reshape(-1, 2)
+
+    if camera_data.matrix is None or camera_data.distortions is None:
+        raise ValueError(f"Camera {camera_data.cam_id} missing intrinsics for pixel-mode reprojection")
+
+    object_points = world_coords.reshape(-1, 1, 3).astype(np.float64)
+    rvec64 = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+    tvec64 = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+    matrix64 = np.asarray(camera_data.matrix, dtype=np.float64)
+
+    if camera_data.uses_fisheye_model:
+        dist_coeffs = np.asarray(camera_data.distortions, dtype=np.float64).reshape(-1, 1)
+        projected, _ = cv2.fisheye.projectPoints(
+            object_points,
+            rvec64,
+            tvec64,
+            matrix64,
+            dist_coeffs[:4],
+        )
+    else:
+        dist_coeffs = np.asarray(camera_data.distortions, dtype=np.float64)
+        projected, _ = cv2.projectPoints(
+            object_points,
+            rvec64,
+            tvec64,
+            matrix64,
+            dist_coeffs,
+        )
+
+    return projected.reshape(-1, 2)
+
+
 def reprojection_errors(
     camera_array: CameraArray,
     camera_indices: CameraIndices,  # (n_observations,)
@@ -60,14 +111,6 @@ def reprojection_errors(
         if use_normalized:
             # Normalized mode: undistort observations, project with identity K
             cam_observed = camera_data.undistort_points(cam_observed, output="normalized")
-            cam_matrix = np.identity(3)
-            dist_coeffs = np.zeros(5)  # No distortion in normalized space
-        else:
-            # Pixel mode: keep distorted observations, project with full model
-            if camera_data.matrix is None or camera_data.distortions is None:
-                raise ValueError(f"Camera {cam_id} missing intrinsics for pixel-mode reprojection")
-            cam_matrix = camera_data.matrix
-            dist_coeffs = camera_data.distortions
 
         # Get extrinsics: from override if provided, otherwise from camera_data
         if extrinsics_override is not None:
@@ -81,15 +124,13 @@ def reprojection_errors(
             rvec = rvec.ravel()
             tvec = camera_data.translation
 
-        # Project 3D points to 2D
-        projected, _ = cv2.projectPoints(
-            cam_world_coords.reshape(-1, 1, 3),
-            rvec,
-            tvec,
-            cam_matrix,
-            dist_coeffs,
+        projected = project_world_to_image(
+            camera_data,
+            cam_world_coords,
+            rvec=rvec,
+            tvec=tvec,
+            use_normalized=use_normalized,
         )
-        projected = projected.reshape(-1, 2)  # (n_cam_obs, 2)
         errors_xy[cam_mask] = projected - cam_observed
 
     return errors_xy  # (n_observations, 2)

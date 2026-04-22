@@ -23,6 +23,105 @@ DEFAULT_OUTLIER_THRESHOLD = 1.5
 DEFAULT_GOLD_STANDARD_BOARDS = 10
 
 
+def _object_points_are_planar(obj_points: NDArray[np.float32], atol: float = 1e-6) -> bool:
+    """Return True when the target points lie on one plane in object space.
+
+    ArUco cube pose solving uses this to distinguish one-face observations
+    from multi-face observations, which need different PnP solver choices.
+    """
+    if len(obj_points) < 3:
+        return True
+
+    centered = obj_points - obj_points.mean(axis=0, keepdims=True)
+    return np.linalg.matrix_rank(centered, tol=atol) <= 2
+
+
+def _object_points_use_canonical_board_plane(obj_points: NDArray[np.float32], atol: float = 1e-6) -> bool:
+    """Return True when planar points already lie on a z-constant board plane.
+
+    Some OpenCV planar solvers expect board-like coordinates. Cube faces can
+    live on arbitrary 3D planes, so non-canonical planar observations are first
+    mapped to a local z=0 plane and transformed back after solving.
+    """
+    return bool(np.max(np.abs(obj_points[:, 2] - obj_points[0, 2])) <= atol)
+
+
+def _canonicalize_planar_object_points(
+    obj_points: NDArray[np.float32],
+) -> tuple[NDArray[np.float32], NDArray[np.float64], NDArray[np.float64]]:
+    """Map arbitrary coplanar 3D points into a local z=0 plane.
+
+    Returns local object points plus the transform needed to convert the solved
+    local-plane pose back into the original cube object frame. This keeps IPPE
+    usable for any physical cube face, not just faces already aligned with z=0.
+    """
+    origin = obj_points[0].astype(np.float64)
+    centered = obj_points.astype(np.float64) - origin
+
+    x_axis = None
+    for candidate in centered[1:]:
+        norm = np.linalg.norm(candidate)
+        if norm > 1e-8:
+            x_axis = candidate / norm
+            break
+    if x_axis is None:
+        raise ValueError("Cannot canonicalize planar object points with zero spread")
+
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+    normal = vh[-1]
+    normal /= np.linalg.norm(normal)
+    y_axis = np.cross(normal, x_axis)
+    y_norm = np.linalg.norm(y_axis)
+    if y_norm <= 1e-8:
+        raise ValueError("Cannot canonicalize planar object points with collinear samples")
+    y_axis /= y_norm
+    x_axis = np.cross(y_axis, normal)
+    x_axis /= np.linalg.norm(x_axis)
+
+    plane_to_object = np.column_stack((x_axis, y_axis, normal))
+    local_xy = centered @ plane_to_object[:, :2]
+    local_obj_points = np.column_stack((local_xy, np.zeros(len(obj_points)))).astype(np.float32)
+    return local_obj_points, plane_to_object, origin
+
+
+def _extract_object_points(group: pd.DataFrame) -> tuple[pd.DataFrame, NDArray[np.float32]]:
+    """Build 3D object points for PnP while preserving non-planar targets."""
+    required_cols = ["obj_loc_x", "obj_loc_y"]
+    working = group.dropna(subset=required_cols).copy()
+
+    if working.empty:
+        return working, np.empty((0, 3), dtype=np.float32)
+
+    if "obj_loc_z" not in working.columns or working["obj_loc_z"].isna().all():
+        working["obj_loc_z"] = 0.0
+    else:
+        working = working.dropna(subset=["obj_loc_z"]).copy()
+
+    obj_points = working[["obj_loc_x", "obj_loc_y", "obj_loc_z"]].to_numpy(dtype=np.float32)
+    return working, obj_points
+
+
+def _pair_consistency_score(stereo_pairs: list[StereoPair]) -> float:
+    """Estimate pair quality from multi-frame pose agreement when stereo RMSE is unavailable."""
+    if not stereo_pairs:
+        return float("inf")
+    if len(stereo_pairs) == 1:
+        return 0.0
+
+    translations = np.array([sp.translation for sp in stereo_pairs], dtype=np.float64)
+    translation_center = np.median(translations, axis=0)
+    translation_spread = np.linalg.norm(translations - translation_center, axis=1)
+    translation_scale = max(np.linalg.norm(translation_center), 1e-6)
+    translation_score = 100.0 * float(np.mean(translation_spread) / translation_scale)
+
+    quats = np.array([np.roll(Rotation.from_matrix(sp.rotation).as_quat(), 1) for sp in stereo_pairs])
+    median_quat = quaternion_average(quats)
+    median_rotation = Rotation.from_quat(np.roll(median_quat, -1)).as_matrix()
+    rotation_score = float(np.mean([rotation_error(sp.rotation, median_rotation) for sp in stereo_pairs]))
+
+    return rotation_score + translation_score
+
+
 class PoseNetworkBuilder:
     """
     Fluent builder for creating PairedPoseNetwork from camera array and point data.
@@ -256,33 +355,58 @@ def compute_camera_to_object_poses_pnp(
     start_time = time.time()
     K_perfect = np.identity(3)
     D_perfect = np.zeros(5)
+    planar_count = 0
+    nonplanar_count = 0
 
     for (cam_id, sync_index), group in grouped:
+        group, obj_points = _extract_object_points(group)
         if len(group) < min_points:
             failure_count += 1
             continue
 
-        # Use pre-undistorted points
+        # Use pre-undistorted points aligned with the filtered object rows.
         img_points = group[["undistort_x", "undistort_y"]].to_numpy(dtype=np.float32)
-        obj_points = group[["obj_loc_x", "obj_loc_y"]].to_numpy()
-        obj_points = np.hstack([obj_points, np.zeros((len(obj_points), 1))]).astype(np.float32)
 
-        # PnP with configurable flags
-        success, rvec, tvec = cv2.solvePnP(
-            obj_points, img_points, cameraMatrix=K_perfect, distCoeffs=D_perfect, flags=pnp_flags
-        )
+        is_planar = _object_points_are_planar(obj_points)
+        solve_obj_points = obj_points
+        plane_to_object = None
+        plane_origin = None
 
-        if not success:
+        if is_planar and _object_points_use_canonical_board_plane(obj_points):
+            planar_count += 1
+            candidate_flags = (pnp_flags, fallback_flags)
+        elif is_planar:
+            planar_count += 1
+            solve_obj_points, plane_to_object, plane_origin = _canonicalize_planar_object_points(obj_points)
+            candidate_flags = (pnp_flags, fallback_flags)
+        else:
+            nonplanar_count += 1
+            candidate_flags = (cv2.SOLVEPNP_EPNP, fallback_flags)
+
+        success = False
+        for flags in dict.fromkeys(candidate_flags):
             success, rvec, tvec = cv2.solvePnP(
-                obj_points, img_points, cameraMatrix=K_perfect, distCoeffs=D_perfect, flags=fallback_flags
+                solve_obj_points,
+                img_points,
+                cameraMatrix=K_perfect,
+                distCoeffs=D_perfect,
+                flags=flags,
             )
+            if success:
+                break
 
         if success:
             R, _ = cv2.Rodrigues(rvec)
             t = tvec.flatten()
 
+            if plane_to_object is not None and plane_origin is not None:
+                R = R @ plane_to_object.T
+                t = t - R @ plane_origin
+
             # Compute reprojection error in normalized space
-            projected, _ = cv2.projectPoints(obj_points, rvec, tvec, K_perfect, D_perfect)
+            rvec_eval, _ = cv2.Rodrigues(R)
+            tvec_eval = t.reshape(3, 1)
+            projected, _ = cv2.projectPoints(obj_points, rvec_eval, tvec_eval, K_perfect, D_perfect)
             rmse = np.sqrt(np.mean(np.sum((img_points - projected.reshape(-1, 2)) ** 2, axis=1)))
 
             poses[(cam_id, sync_index)] = (R, t, rmse)
@@ -295,6 +419,7 @@ def compute_camera_to_object_poses_pnp(
         f"PnP complete: {success_count} successes, {failure_count} failures "
         f"in {elapsed:.2f}s ({elapsed / max(success_count, 1) * 1000:.2f}ms avg)"
     )
+    logger.info(f"PnP target geometry mix: {planar_count} planar groups, {nonplanar_count} non-planar groups")
     return poses
 
 
@@ -518,7 +643,13 @@ def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> 
             continue
 
         if len(stereo_pairs) == 1:
-            aggregated[pair] = stereo_pairs[0]
+            aggregated[pair] = StereoPair(
+                primary_cam_id=stereo_pairs[0].primary_cam_id,
+                secondary_cam_id=stereo_pairs[0].secondary_cam_id,
+                error_score=0.0,
+                rotation=stereo_pairs[0].rotation,
+                translation=stereo_pairs[0].translation,
+            )
             continue
 
         # Extract and average rotations (via quaternion space)
@@ -533,7 +664,7 @@ def aggregate_poses(filtered_poses: dict[tuple[int, int], list[StereoPair]]) -> 
         aggregated[pair] = StereoPair(
             primary_cam_id=pair[0],
             secondary_cam_id=pair[1],
-            error_score=float("nan"),  # Placeholder until RMSE calculation
+            error_score=_pair_consistency_score(stereo_pairs),
             rotation=avg_R,
             translation=avg_t,
         )
@@ -562,7 +693,18 @@ def estimate_pnp_paired_pose_network(
     for pair, stereo_pair in aggregated_pairs_wo_rmse.items():
         rmse = calculate_stereo_rmse_for_pair(stereo_pair, camera_array, common_observations)
         if rmse is None:
-            logger.warning(f"Could not compute RMSE for pair {pair}, skipping")
+            if not np.isfinite(stereo_pair.error_score):
+                logger.warning(f"Could not compute RMSE for pair {pair}, skipping")
+                continue
+
+            pairs_with_rmse[pair] = StereoPair(
+                primary_cam_id=stereo_pair.primary_cam_id,
+                secondary_cam_id=stereo_pair.secondary_cam_id,
+                error_score=stereo_pair.error_score,
+                rotation=stereo_pair.rotation,
+                translation=stereo_pair.translation,
+            )
+            logger.info(f"Pair {pair}: using pose-consistency score = {stereo_pair.error_score:.6f}")
             continue
 
         # Create new StereoPair with RMSE populated

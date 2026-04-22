@@ -22,7 +22,7 @@ from caliscope.core.chessboard import Chessboard
 logger = logging.getLogger(__name__)
 
 IntrinsicTargetType = Literal["charuco", "chessboard"]
-ExtrinsicTargetType = Literal["charuco", "aruco"]
+ExtrinsicTargetType = Literal["charuco", "aruco_marker", "aruco_cube"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,9 +72,10 @@ class CalibrationTargetsRepository:
                 extrinsic_charuco_same_as_intrinsic=True,
             )
         data = rtoml.load(self._config_path)
+        extrinsic_target_type = self._normalize_extrinsic_target_type(data.get("extrinsic_target_type", "charuco"))
         return TargetRouting(
             intrinsic_target_type=data.get("intrinsic_target_type", "charuco"),
-            extrinsic_target_type=data.get("extrinsic_target_type", "charuco"),
+            extrinsic_target_type=extrinsic_target_type,
             extrinsic_charuco_same_as_intrinsic=data.get("extrinsic_charuco_same_as_intrinsic", True),
         )
 
@@ -98,6 +99,20 @@ class CalibrationTargetsRepository:
     def extrinsic_target_type(self) -> ExtrinsicTargetType:
         """Current extrinsic target type (convenience)."""
         return self.get_routing().extrinsic_target_type
+
+    def _normalize_extrinsic_target_type(self, raw_target_type: str) -> ExtrinsicTargetType:
+        """Map legacy target types onto the current explicit extrinsic choices."""
+        if raw_target_type in ("charuco", "aruco_marker", "aruco_cube"):
+            return raw_target_type
+
+        if raw_target_type == "aruco":
+            try:
+                return "aruco_cube" if self.load_aruco_target().is_cube else "aruco_marker"
+            except ValueError:
+                return "aruco_marker"
+
+        logger.warning(f"Unknown extrinsic target type '{raw_target_type}', defaulting to charuco")
+        return "charuco"
 
     @property
     def extrinsic_charuco_same_as_intrinsic(self) -> bool:
@@ -238,13 +253,15 @@ class CalibrationTargetsRepository:
     def get_extrinsic_tracker_name(self) -> str:
         """Return the tracker name string for the current extrinsic target type.
 
-        Returns "CHARUCO" or "ARUCO". Used for:
-        - The extraction output subfolder name (extrinsic/CHARUCO/ or extrinsic/ARUCO/)
+        Returns "CHARUCO", "ARUCO", or "ARUCO_CUBE". Used for:
+        - The extraction output subfolder name
         - The extrinsic_image_points_path computation
         """
         routing = self.get_routing()
         if routing.extrinsic_target_type == "charuco":
             return "CHARUCO"
+        if routing.extrinsic_target_type == "aruco_cube":
+            return "ARUCO_CUBE"
         else:
             return "ARUCO"
 
