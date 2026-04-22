@@ -19,6 +19,7 @@ from caliscope.core.frame_selector import (
     IntrinsicCoverageReport,
     OrientationFeatures,
     _compute_orientation_features,
+    _frame_supports_planar_calibration,
     _get_orientation_bin,
     _score_frame,
     select_calibration_frames,
@@ -295,6 +296,34 @@ class TestEdgeCases:
         assert result.total_frame_count == 5
         assert result.eligible_frame_count == 0
         assert result.orientation_sufficient is False
+
+    def test_collinear_corners_are_ineligible(self):
+        """Frames with enough but collinear corners cannot initialize calibration."""
+        data = []
+        for point_id in range(6):
+            data.append(
+                {
+                    "sync_index": 0,
+                    "cam_id": 0,
+                    "point_id": point_id,
+                    "img_loc_x": 100 + point_id * 20,
+                    "img_loc_y": 200 + point_id * 10,
+                    "obj_loc_x": point_id * 0.05,
+                    "obj_loc_y": 0.0,
+                }
+            )
+
+        frame_df = pd.DataFrame(data)
+        assert _frame_supports_planar_calibration(frame_df, min_corners=6) is False
+
+        result = select_calibration_frames(
+            ImagePoints(frame_df),
+            cam_id=0,
+            image_size=(1920, 1080),
+        )
+
+        assert result.selected_frames == []
+        assert result.eligible_frame_count == 0
 
 
 class TestIntegration:

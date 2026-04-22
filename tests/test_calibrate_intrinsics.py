@@ -9,6 +9,7 @@ These tests validate:
 import logging
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from caliscope import __root__
@@ -104,6 +105,34 @@ class TestCalibrateIntrinsics:
                 cam_id=999,  # Non-existent camera
                 image_size=IMAGE_SIZE,
                 selected_frames=[0, 1, 2],
+            )
+
+    def test_calibrate_skips_degenerate_collinear_frame(self):
+        """OpenCV should not receive frames that cannot form a homography."""
+        rows = []
+        for point_id in range(6):
+            rows.append(
+                {
+                    "sync_index": 0,
+                    "cam_id": 0,
+                    "point_id": point_id,
+                    "img_loc_x": 100 + point_id * 20,
+                    "img_loc_y": 200 + point_id * 10,
+                    "obj_loc_x": point_id * 0.05,
+                    "obj_loc_y": 0.0,
+                    "obj_loc_z": 0.0,
+                }
+            )
+
+        image_points = ImagePoints(pd.DataFrame(rows))
+
+        with pytest.raises(ValueError, match="No valid calibration frames"):
+            calibrate_intrinsics(
+                image_points,
+                cam_id=0,
+                image_size=IMAGE_SIZE,
+                selected_frames=[0],
+                fisheye=True,
             )
 
 

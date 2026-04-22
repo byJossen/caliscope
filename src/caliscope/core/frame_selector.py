@@ -99,7 +99,7 @@ def select_calibration_frames(
     cam_id: int,
     image_size: tuple[int, int],
     *,
-    target_frame_count: int = 30,
+    target_frame_count: int = 100,
     min_corners_per_frame: int = 6,
     min_orientations: int = 4,
     grid_size: int = 5,
@@ -213,11 +213,12 @@ def _filter_eligible_frames(
     cam_df: pd.DataFrame,
     min_corners: int,
 ) -> list[int]:
-    """Filter frames meeting minimum corner count.
+    """Filter frames meeting minimum corner count and calibration geometry.
 
-    Only filters by corner count - no coverage filtering. This allows frames
-    with distant (small-appearing) boards to be included, which is valuable
-    for focal length estimation per Zhang (2000).
+    This deliberately does not filter by image coverage. Distant boards are
+    valuable for focal length estimation, but every selected frame still needs
+    enough non-collinear object/image points for OpenCV to initialize a planar
+    calibration homography.
     """
     eligible: list[int] = []
     grouped = cam_df.groupby("sync_index")
@@ -225,11 +226,53 @@ def _filter_eligible_frames(
         frame_df = cast(pd.DataFrame, frame_group)
         sync_index = int(sync_index_key)  # type: ignore[arg-type]
 
-        # Check corner count only
-        if len(frame_df) >= min_corners:
+        if _frame_supports_planar_calibration(frame_df, min_corners=min_corners):
             eligible.append(sync_index)
 
     return sorted(eligible)  # Sorted for determinism
+
+
+def _frame_supports_planar_calibration(frame_df: pd.DataFrame, min_corners: int = 4) -> bool:
+    """Return True when a frame can support OpenCV planar intrinsic calibration.
+
+    OpenCV's intrinsic initializers estimate a homography per board view. Frames
+    with enough detected corners can still be unusable when those corners are
+    collinear, nearly coincident, non-finite, or missing object coordinates.
+    Passing such frames into calibrateCamera/fisheye.calibrate triggers low-level
+    assertion errors, so we reject them before selection/calibration.
+    """
+    if len(frame_df) < max(4, min_corners):
+        return False
+
+    required_columns = ["obj_loc_x", "obj_loc_y", "img_loc_x", "img_loc_y"]
+    if any(column not in frame_df.columns for column in required_columns):
+        return False
+
+    obj_xy = frame_df[["obj_loc_x", "obj_loc_y"]].to_numpy(dtype=np.float64)
+    img_xy = frame_df[["img_loc_x", "img_loc_y"]].to_numpy(dtype=np.float64)
+
+    finite_rows = np.isfinite(obj_xy).all(axis=1) & np.isfinite(img_xy).all(axis=1)
+    obj_xy = obj_xy[finite_rows]
+    img_xy = img_xy[finite_rows]
+
+    if len(obj_xy) < max(4, min_corners):
+        return False
+    if len(np.unique(obj_xy, axis=0)) < 4 or len(np.unique(img_xy, axis=0)) < 4:
+        return False
+
+    obj_centered = obj_xy - obj_xy.mean(axis=0)
+    img_centered = img_xy - img_xy.mean(axis=0)
+    if np.linalg.matrix_rank(obj_centered, tol=1e-9) < 2:
+        return False
+    if np.linalg.matrix_rank(img_centered, tol=1e-6) < 2:
+        return False
+
+    obj_scale = np.ptp(obj_xy, axis=0)
+    obj_scale[obj_scale < 1e-9] = 1.0
+    obj_normalized = (obj_xy - obj_xy.min(axis=0)) / obj_scale
+    homography, _ = cv2.findHomography(obj_normalized.astype(np.float32), img_xy.astype(np.float32), 0)
+
+    return homography is not None and homography.shape == (3, 3) and bool(np.isfinite(homography).all())
 
 
 def _compute_frame_coverage(

@@ -35,6 +35,32 @@ from caliscope.tracker import Tracker
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_MAX_COLLECTION_FRAMES = 600
+
+
+def _sample_collection_indices(
+    last_frame_index: int,
+    frame_skip: int,
+    max_frame_count: int | None = DEFAULT_MAX_COLLECTION_FRAMES,
+) -> list[int]:
+    """Return uniformly distributed frame indices for intrinsic candidate collection."""
+    if last_frame_index < 0:
+        return []
+
+    frame_skip = max(1, int(frame_skip))
+    candidate_indices = list(range(0, last_frame_index + 1, frame_skip))
+
+    if max_frame_count is None or len(candidate_indices) <= max_frame_count:
+        return candidate_indices
+
+    max_frame_count = max(1, int(max_frame_count))
+    if max_frame_count == 1:
+        return [candidate_indices[0]]
+
+    step = (len(candidate_indices) - 1) / (max_frame_count - 1)
+    sampled_positions = [round(i * step) for i in range(max_frame_count)]
+    return [candidate_indices[position] for position in sampled_positions]
+
 
 class IntrinsicCalibrationState(Enum):
     """Workflow states for intrinsic calibration.
@@ -79,6 +105,9 @@ class IntrinsicCalibrationPresenter(QObject):
     calibration_complete = Signal(object)  # IntrinsicCalibrationOutput
     calibration_failed = Signal(str)
     frame_position_changed = Signal(int)  # Current frame index
+    fisheye_changed = Signal(int, bool)  # cam_id, fisheye enabled
+
+    _calibration_inputs_ready = Signal(object, object)  # ImagePoints, IntrinsicCoverageReport
 
     def __init__(
         self,
@@ -90,6 +119,7 @@ class IntrinsicCalibrationPresenter(QObject):
         restored_report: IntrinsicCalibrationReport | None = None,
         restored_points: list[tuple[int, PointPacket]] | None = None,
         frame_skip: int = 1,
+        max_collection_frames: int | None = DEFAULT_MAX_COLLECTION_FRAMES,
     ) -> None:
         """Initialize the presenter.
 
@@ -102,6 +132,7 @@ class IntrinsicCalibrationPresenter(QObject):
             restored_report: Optional report from previous calibration for overlay restoration
             restored_points: Optional collected points from previous calibration (session-only)
             frame_skip: Process every Nth frame during collection
+            max_collection_frames: Maximum candidate frames to process after frame_skip.
         """
         super().__init__(parent)
 
@@ -110,6 +141,7 @@ class IntrinsicCalibrationPresenter(QObject):
         self._tracker = tracker
         self._task_manager = task_manager
         self._frame_skip = frame_skip
+        self._max_collection_frames = max_collection_frames
 
         # Derived properties for convenience
         self._cam_id = camera.cam_id
@@ -167,6 +199,11 @@ class IntrinsicCalibrationPresenter(QObject):
         self._stop_event = Event()
         self._consumer_thread = Thread(target=self._consume_frames, daemon=True)
         self._consumer_thread.start()
+
+        self._calibration_inputs_ready.connect(
+            self._submit_calibration_task,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     @property
     def state(self) -> IntrinsicCalibrationState:
@@ -337,10 +374,17 @@ class IntrinsicCalibrationPresenter(QObject):
         last_index = self._streamer.last_frame_index
         frame_skip = max(1, self._frame_skip)
 
-        indices = list(range(0, last_index + 1, frame_skip))
+        uncapped_count = len(range(0, last_index + 1, frame_skip))
+        indices = _sample_collection_indices(last_index, frame_skip, self._max_collection_frames)
         total = len(indices)
 
-        logger.info(f"Collection batch: {total} frames (skip={frame_skip}, total available={last_index + 1})")
+        if total < uncapped_count:
+            logger.info(
+                f"Collection batch capped from {uncapped_count} to {total} uniformly sampled frames "
+                f"(skip={frame_skip}, total available={last_index + 1})"
+            )
+        else:
+            logger.info(f"Collection batch: {total} frames (skip={frame_skip}, total available={last_index + 1})")
 
         try:
             for i, frame_idx in enumerate(indices):
@@ -449,6 +493,10 @@ class IntrinsicCalibrationPresenter(QObject):
 
         # Store selection result for overlay rendering
         self._selection_result = selection_result
+        self._calibration_inputs_ready.emit(image_points, selection_result)
+
+    def _submit_calibration_task(self, image_points: ImagePoints, selection_result: IntrinsicCoverageReport) -> None:
+        """Submit OpenCV intrinsic calibration on the presenter's Qt thread."""
 
         # Capture camera for closure (avoid stale reference)
         camera = self._camera
@@ -478,6 +526,30 @@ class IntrinsicCalibrationPresenter(QObject):
         self._task_manager.start_task(self._calibration_task.task_id)
 
         self._emit_state_changed()
+
+    def set_fisheye(self, enabled: bool) -> None:
+        """Set the camera lens model used for the next intrinsic calibration."""
+        enabled = bool(enabled)
+        if self.state in (IntrinsicCalibrationState.COLLECTING, IntrinsicCalibrationState.CALIBRATING):
+            logger.warning(f"Cannot change fisheye model while calibration is running for cam_id {self._cam_id}")
+            return
+
+        if self._camera.fisheye == enabled:
+            return
+
+        self._camera.fisheye = enabled
+        self._camera.error = None
+        self._camera.matrix = None
+        self._camera.distortions = None
+        self._camera.grid_count = None
+        self._selection_result = None
+        self._output = None
+        self._collected_points.clear()
+
+        logger.info(f"Set fisheye={enabled} for cam_id {self._cam_id}; cleared prior intrinsic result")
+        self.fisheye_changed.emit(self._cam_id, enabled)
+        self._emit_state_changed()
+        self.refresh_display()
 
     def _build_image_points(self) -> ImagePoints:
         """Convert accumulated (frame_index, PointPacket) to ImagePoints."""

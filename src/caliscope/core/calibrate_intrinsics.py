@@ -21,13 +21,18 @@ import numpy as np
 from numpy.typing import NDArray
 
 from caliscope.cameras.camera_array import CameraData
-from caliscope.core.frame_selector import IntrinsicCoverageReport, select_calibration_frames
+from caliscope.core.frame_selector import (
+    IntrinsicCoverageReport,
+    _frame_supports_planar_calibration,
+    select_calibration_frames,
+)
 from caliscope.core.point_data import ImagePoints
 
 logger = logging.getLogger(__name__)
 
 # Minimum corners required per frame for OpenCV calibration
 MIN_CORNERS_PER_FRAME = 4
+MIN_CALIBRATION_FRAMES = 3
 
 
 @dataclass(frozen=True)
@@ -123,48 +128,77 @@ def calibrate_intrinsics(
     if len(obj_points_list) == 0:
         raise ValueError(
             f"No valid calibration frames found for cam_id {cam_id}. "
-            f"Ensure frames have at least {MIN_CORNERS_PER_FRAME} corners each."
+            f"Ensure frames have at least {MIN_CORNERS_PER_FRAME} non-collinear corners each."
+        )
+
+    if len(obj_points_list) < MIN_CALIBRATION_FRAMES:
+        raise ValueError(
+            f"Only {len(obj_points_list)} valid calibration frame(s) found for cam_id {cam_id}. "
+            f"Need at least {MIN_CALIBRATION_FRAMES} non-degenerate board views."
         )
 
     width, height = image_size
 
-    if fisheye:
-        # Fisheye requires specific array shapes: (N, 1, D)
-        obj_pts = [p.reshape(-1, 1, 3).astype(np.float32) for p in obj_points_list]
-        img_pts = [p.reshape(-1, 1, 2).astype(np.float32) for p in img_points_list]
+    try:
+        if fisheye:
+            # Fisheye requires specific array shapes: (N, 1, D)
+            obj_pts = [p.reshape(-1, 1, 3).astype(np.float32) for p in obj_points_list]
+            img_pts = [p.reshape(-1, 1, 2).astype(np.float32) for p in img_points_list]
 
-        # Pre-initialize output matrices (required for fisheye.calibrate)
-        camera_matrix = np.zeros((3, 3), dtype=np.float64)
-        dist_coeffs = np.zeros(4, dtype=np.float64)
+            # Seed fisheye calibration with a standard pinhole solve. OpenCV's
+            # fisheye initializer is fragile with partial ChArUco views unless
+            # K starts close to the real intrinsics.
+            standard_obj_pts = [p.astype(np.float32) for p in obj_points_list]
+            standard_img_pts = [p.astype(np.float32) for p in img_points_list]
+            _, camera_matrix, _, _, _ = cv2.calibrateCamera(
+                standard_obj_pts,
+                standard_img_pts,
+                (width, height),
+                np.zeros((3, 3), dtype=np.float64),
+                np.zeros(5, dtype=np.float64),
+            )
+            dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-        error, mtx, dist, rvecs, tvecs = cv2.fisheye.calibrate(
-            obj_pts,
-            img_pts,
-            (width, height),
-            camera_matrix,
-            dist_coeffs,
-            flags=cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC,
-        )
-        # fisheye.calibrate returns dist as (4,) already
-        dist = dist.ravel()
-    else:
-        # Standard calibration accepts (N, D) arrays
-        obj_pts = [p.astype(np.float32) for p in obj_points_list]
-        img_pts = [p.astype(np.float32) for p in img_points_list]
+            error, mtx, dist, rvecs, tvecs = cv2.fisheye.calibrate(
+                obj_pts,
+                img_pts,
+                (width, height),
+                camera_matrix,
+                dist_coeffs,
+                flags=(
+                    cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+                    | cv2.fisheye.CALIB_FIX_SKEW
+                    | cv2.fisheye.CALIB_USE_INTRINSIC_GUESS
+                ),
+                criteria=(cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6),
+            )
+            # fisheye.calibrate returns dist as (4,) already
+            dist = dist.ravel()
+        else:
+            # Standard calibration accepts (N, D) arrays
+            obj_pts = [p.astype(np.float32) for p in obj_points_list]
+            img_pts = [p.astype(np.float32) for p in img_points_list]
 
-        # Pre-initialize output matrices (required by type checker, works at runtime)
-        camera_matrix = np.zeros((3, 3), dtype=np.float64)
-        dist_coeffs = np.zeros(5, dtype=np.float64)
+            # Pre-initialize output matrices (required by type checker, works at runtime)
+            camera_matrix = np.zeros((3, 3), dtype=np.float64)
+            dist_coeffs = np.zeros(5, dtype=np.float64)
 
-        error, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
-            obj_pts,
-            img_pts,
-            (width, height),
-            camera_matrix,
-            dist_coeffs,
-        )
-        # calibrateCamera returns dist as (1, 5), flatten it
-        dist = dist.ravel()
+            error, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+                obj_pts,
+                img_pts,
+                (width, height),
+                camera_matrix,
+                dist_coeffs,
+            )
+            # calibrateCamera returns dist as (1, 5), flatten it
+            dist = dist.ravel()
+    except cv2.error as e:
+        model_name = "fisheye" if fisheye else "standard"
+        raise ValueError(
+            f"OpenCV {model_name} intrinsic calibration failed after filtering to "
+            f"{len(obj_points_list)} non-degenerate frame(s). Try collecting more tilted board views "
+            f"with corners spread across both board axes. Original OpenCV error: {e}"
+        ) from e
 
     logger.info(f"Calibration complete for cam_id {cam_id}: error={error:.4f}px, frames={len(obj_points_list)}")
 
@@ -203,6 +237,9 @@ def _extract_calibration_arrays(
 
         if len(frame_df) < MIN_CORNERS_PER_FRAME:
             logger.debug(f"Skipping frame {sync_index}: only {len(frame_df)} corners (need {MIN_CORNERS_PER_FRAME})")
+            continue
+        if not _frame_supports_planar_calibration(frame_df, min_corners=MIN_CORNERS_PER_FRAME):
+            logger.debug(f"Skipping frame {sync_index}: degenerate calibration geometry")
             continue
 
         # Extract image coordinates as numpy array

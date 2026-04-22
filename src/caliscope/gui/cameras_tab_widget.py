@@ -180,6 +180,7 @@ class CamerasTabWidget(QWidget):
                 return
 
             presenter.calibration_complete.connect(partial(self._on_calibration_complete, cam_id))
+            presenter.fisheye_changed.connect(self.coordinator.persist_camera_fisheye)
             widget = IntrinsicCalibrationWidget(presenter)
 
             self._presenters[cam_id] = presenter

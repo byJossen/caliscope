@@ -39,7 +39,7 @@ class CameraData:
     ignore: bool = False
     translation: np.ndarray | None = None  # camera relative to world
     rotation: np.ndarray | None = None  # camera relative to world
-    fisheye: bool = False  # default to standard camera model
+    fisheye: bool = False  # standard lens model by default; fisheye is explicit opt-in
 
     @property
     def transformation(self):
@@ -62,6 +62,13 @@ class CameraData:
     def normalized_projection_matrix(self):
         assert self.matrix is not None and self.transformation is not None
         return self.transformation[0:3, :]
+
+    @property
+    def uses_fisheye_model(self) -> bool:
+        """True only when fisheye is enabled and the calibration matches OpenCV's 4-coefficient model."""
+        if not self.fisheye or self.distortions is None:
+            return False
+        return int(np.asarray(self.distortions).size) == 4
 
     def extrinsics_to_vector(self):
         """
@@ -113,7 +120,7 @@ class CameraData:
         else:  # output == "pixels"
             projection_matrix = self.matrix
 
-        if self.fisheye:
+        if self.uses_fisheye_model:
             undistorted_points = cv2.fisheye.undistortPoints(
                 points_reshaped, self.matrix, self.distortions, P=projection_matrix
             )
@@ -147,7 +154,7 @@ class CameraData:
 
         # Check if we need to (re)compute remap tables
         if not hasattr(self, "_remap_cache") or self._remap_cache.get("size") != frame_size:
-            if self.fisheye:
+            if self.uses_fisheye_model:
                 map1, map2 = cv2.fisheye.initUndistortRectifyMap(
                     self.matrix, self.distortions, np.eye(3), self.matrix, frame_size, cv2.CV_16SC2
                 )
@@ -183,7 +190,7 @@ class CameraData:
         if self.distortions is not None:
             coeffs = self.distortions.ravel().tolist()
             logger.info(f"Unpacking distortion coefficients: {coeffs}")
-            if self.fisheye:
+            if self.uses_fisheye_model:
                 # Fisheye model uses 4 coefficients: k1, k2, k3, k4
                 k1, k2, k3, k4 = coeffs
                 distortion_coeffs_dict["radial_k1"] = round_or_none(k1, 2)

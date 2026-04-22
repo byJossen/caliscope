@@ -43,6 +43,8 @@ from caliscope.packets import FramePacket, PointPacket
 
 logger = logging.getLogger(__name__)
 
+MAX_ACCUMULATED_OVERLAY_GRIDS = 120
+
 
 @dataclass
 class OverlaySettings:
@@ -73,7 +75,7 @@ class CalibrationResultsDisplay(QWidget):
     # QToolTip rule ensures tooltip popup doesn't inherit the underline
     _INFO_LABEL_STYLE = (
         "QLabel { text-decoration: underline dotted; text-decoration-color: #888; "
-        "text-underline-offset: 2px; } "
+        "} "
         "QToolTip { text-decoration: none; }"
     )
 
@@ -438,6 +440,13 @@ class FrameRenderThread(QThread):
         if not collected:
             return frame
 
+        if len(collected) > MAX_ACCUMULATED_OVERLAY_GRIDS:
+            stride = max(
+                1,
+                (len(collected) + MAX_ACCUMULATED_OVERLAY_GRIDS - 1) // MAX_ACCUMULATED_OVERLAY_GRIDS,
+            )
+            collected = collected[::stride]
+
         overlay = frame.copy()
         for _, points in collected:
             for x, y in points.img_loc:
@@ -634,6 +643,15 @@ class IntrinsicCalibrationWidget(QWidget):
         self._calibrate_btn.clicked.connect(self._on_calibrate_clicked)
         controls.addWidget(self._calibrate_btn)
 
+        self._fisheye_checkbox = QCheckBox("Fisheye lens")
+        self._fisheye_checkbox.setChecked(self._presenter.camera.fisheye)
+        self._fisheye_checkbox.setToolTip(
+            "Use OpenCV's fisheye intrinsic model for this camera.\n\n"
+            "Leave unchecked for normal rectilinear lenses. Changing this clears the previous intrinsic result."
+        )
+        self._fisheye_checkbox.toggled.connect(self._on_fisheye_toggled)
+        controls.addWidget(self._fisheye_checkbox)
+
         self._undistort_checkbox = QCheckBox("Undistort")
         self._undistort_checkbox.setEnabled(False)
         self._undistort_checkbox.toggled.connect(self._on_undistort_toggled)
@@ -711,21 +729,25 @@ class IntrinsicCalibrationWidget(QWidget):
         if state == IntrinsicCalibrationState.READY:
             self._calibrate_btn.setText("Calibrate")
             self._calibrate_btn.setEnabled(True)
+            self._fisheye_checkbox.setEnabled(True)
             self._undistort_checkbox.setEnabled(False)
             self._position_slider.setEnabled(True)
         elif state == IntrinsicCalibrationState.COLLECTING:
             self._calibrate_btn.setText("Stop")
             self._calibrate_btn.setEnabled(True)
+            self._fisheye_checkbox.setEnabled(False)
             self._undistort_checkbox.setEnabled(False)
             self._position_slider.setEnabled(False)
         elif state == IntrinsicCalibrationState.CALIBRATING:
             self._calibrate_btn.setText("Calibrating...")
             self._calibrate_btn.setEnabled(False)
+            self._fisheye_checkbox.setEnabled(False)
             self._undistort_checkbox.setEnabled(False)
             self._position_slider.setEnabled(False)
         elif state == IntrinsicCalibrationState.CALIBRATED:
             self._calibrate_btn.setText("Recalibrate")
             self._calibrate_btn.setEnabled(True)
+            self._fisheye_checkbox.setEnabled(True)
             self._undistort_checkbox.setEnabled(True)
             self._position_slider.setEnabled(True)
 
@@ -757,6 +779,12 @@ class IntrinsicCalibrationWidget(QWidget):
             self._undistort_checkbox.setChecked(False)
             self._results_display.reset()
             self._presenter.start_calibration()
+
+    def _on_fisheye_toggled(self, checked: bool) -> None:
+        """Handle per-camera lens model changes."""
+        self._undistort_checkbox.setChecked(False)
+        self._results_display.reset()
+        self._presenter.set_fisheye(checked)
 
     def _on_undistort_toggled(self, checked: bool) -> None:
         """Handle undistort checkbox toggle."""
