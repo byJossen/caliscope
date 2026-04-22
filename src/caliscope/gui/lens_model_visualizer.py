@@ -1,8 +1,8 @@
 """Visualize lens model effects for user inspection.
 
-Shows exactly what undistortion does to a frame - no cropping or hiding
-of problematic distortion. When content expands beyond the original frame,
-draws a dashed boundary showing where the original frame was.
+The intrinsic-calibration preview should match the geometry used elsewhere in
+the app. In particular, fisheye previews should use the same output camera
+matrix that the calibrated camera uses for point undistortion and reprojection.
 """
 
 import logging
@@ -77,13 +77,10 @@ def _draw_dashed_rect(
 class LensModelVisualizer:
     """Visualizes lens model effects for user inspection.
 
-    Shows exactly what undistortion does to a frame:
-    - Content that shrinks shows black borders
-    - Content that expands is fully visible with original frame boundary overlay
-    - No cropping or hiding of problematic distortion
-
-    This is a presentation-layer class. Domain-level undistortion (for
-    triangulation/bundle adjustment) uses CameraData.undistort_points directly.
+    The preview uses the calibrated camera's native output geometry so the
+    intrinsic widget matches the rest of Caliscope. That means the preview may
+    clip content near the image edges, but it avoids the misleading "zoomed out"
+    full-content view that made valid fisheye calibrations look wrong.
     """
 
     BOUNDARY_COLOR = (255, 255, 0)  # BGR: cyan
@@ -119,7 +116,7 @@ class LensModelVisualizer:
         return self._content_expands
 
     def _compute_undistortion_params(self) -> None:
-        """Compute remap tables and detect if content expands."""
+        """Compute remap tables using the camera's native output geometry."""
         if self._camera.matrix is None or self._camera.distortions is None:
             logger.debug(f"Camera {self._camera.cam_id} lacks calibration")
             return
@@ -127,110 +124,21 @@ class LensModelVisualizer:
         w, h = self._camera.size
         matrix = self._camera.matrix
         distortions = self._camera.distortions
+        self._content_expands = False
+        self._boundary_rect = None
 
-        # Sample perimeter to find bounds after undistortion
-        edge_samples = 20
-        top = np.column_stack([np.linspace(0, w - 1, edge_samples), np.zeros(edge_samples)])
-        bottom = np.column_stack([np.linspace(0, w - 1, edge_samples), np.full(edge_samples, h - 1)])
-        left = np.column_stack([np.zeros(edge_samples), np.linspace(0, h - 1, edge_samples)])
-        right = np.column_stack([np.full(edge_samples, w - 1), np.linspace(0, h - 1, edge_samples)])
-        perimeter_points = np.vstack([top, bottom, left, right]).astype(np.float32)
-
-        # Get new camera matrix for undistortion
-        if self._camera.fisheye:
-            new_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                matrix, distortions, (w, h), np.eye(3), balance=1.0
-            )
-            undistorted_pts = cv2.fisheye.undistortPoints(
-                perimeter_points.reshape(-1, 1, 2), matrix, distortions, P=new_matrix
+        if self._camera.uses_fisheye_model:
+            self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
+                matrix, distortions, np.eye(3), matrix, (w, h), cv2.CV_16SC2
             )
         else:
-            new_matrix, _ = cv2.getOptimalNewCameraMatrix(matrix, distortions, (w, h), 1, (w, h))
-            undistorted_pts = cv2.undistortPoints(perimeter_points.reshape(-1, 1, 2), matrix, distortions, P=new_matrix)
-
-        # Find bounds of undistorted content
-        min_x = float(np.min(undistorted_pts[:, 0, 0]))
-        max_x = float(np.max(undistorted_pts[:, 0, 0]))
-        min_y = float(np.min(undistorted_pts[:, 0, 1]))
-        max_y = float(np.max(undistorted_pts[:, 0, 1]))
-
-        content_width = max_x - min_x
-        content_height = max_y - min_y
-
-        # Does content expand beyond original frame?
-        self._content_expands = content_width > w or content_height > h
-
-        if self._content_expands:
-            # Zoom out to show all content
-            scale_x = w / content_width
-            scale_y = h / content_height
-            scale = min(scale_x, scale_y)
-
-            # Build scaled camera matrix centered on output
-            output_center_x = w / 2
-            output_center_y = h / 2
-
-            # Where is the content center in undistorted space?
-            content_center_x = (min_x + max_x) / 2
-            content_center_y = (min_y + max_y) / 2
-
-            # Build new matrix that scales and re-centers
-            new_matrix_scaled = np.array(
-                [
-                    [matrix[0, 0] * scale, 0, output_center_x + (new_matrix[0, 2] - content_center_x) * scale],
-                    [0, matrix[1, 1] * scale, output_center_y + (new_matrix[1, 2] - content_center_y) * scale],
-                    [0, 0, 1],
-                ],
-                dtype=np.float64,
+            self._map1, self._map2 = cv2.initUndistortRectifyMap(
+                matrix, distortions, np.eye(3), matrix, (w, h), cv2.CV_16SC2
             )
 
-            # Where do the original frame corners land?
-            original_corners = np.array([[[0, 0]], [[w - 1, 0]], [[w - 1, h - 1]], [[0, h - 1]]], dtype=np.float32)
-
-            if self._camera.fisheye:
-                corners_undist = cv2.fisheye.undistortPoints(original_corners, matrix, distortions, P=new_matrix_scaled)
-            else:
-                corners_undist = cv2.undistortPoints(original_corners, matrix, distortions, P=new_matrix_scaled)
-
-            corners = corners_undist.reshape(-1, 2)
-            bx1 = int(np.min(corners[:, 0]))
-            bx2 = int(np.max(corners[:, 0]))
-            by1 = int(np.min(corners[:, 1]))
-            by2 = int(np.max(corners[:, 1]))
-            self._boundary_rect = ((bx1, by1), (bx2, by2))
-
-            # Build remap tables
-            if self._camera.fisheye:
-                self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
-                    matrix, distortions, np.eye(3), new_matrix_scaled, (w, h), cv2.CV_16SC2
-                )
-            else:
-                self._map1, self._map2 = cv2.initUndistortRectifyMap(
-                    matrix, distortions, np.eye(3), new_matrix_scaled, (w, h), cv2.CV_16SC2
-                )
-
-            logger.debug(
-                f"LensModelVisualizer cam {self._camera.cam_id}: content expands, "
-                f"scale={scale:.3f}, boundary={self._boundary_rect}"
-            )
-        else:
-            # Content fits or shrinks - just undistort, black borders will appear naturally
-            self._boundary_rect = None
-
-            if self._camera.fisheye:
-                final_matrix = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-                    matrix, distortions, (w, h), np.eye(3), balance=1.0, new_size=(w, h)
-                )
-                self._map1, self._map2 = cv2.fisheye.initUndistortRectifyMap(
-                    matrix, distortions, np.eye(3), final_matrix, (w, h), cv2.CV_16SC2
-                )
-            else:
-                final_matrix, _ = cv2.getOptimalNewCameraMatrix(matrix, distortions, (w, h), 1, (w, h))
-                self._map1, self._map2 = cv2.initUndistortRectifyMap(
-                    matrix, distortions, np.eye(3), final_matrix, (w, h), cv2.CV_16SC2
-                )
-
-            logger.debug(f"LensModelVisualizer cam {self._camera.cam_id}: content fits within frame")
+        logger.debug(
+            f"LensModelVisualizer cam {self._camera.cam_id}: preview uses native output geometry"
+        )
 
     def undistort(self, frame: NDArray) -> NDArray:
         """Undistort a frame for visualization.
