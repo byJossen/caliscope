@@ -20,6 +20,7 @@ from caliscope.cameras.camera_array import CameraData
 from caliscope.core.coverage_analysis import (
     ExtrinsicCoverageReport,
     analyze_multi_camera_coverage,
+    MIN_RIGID_TARGET_POINTS_PER_CAMERA,
 )
 from caliscope.core.point_data import ImagePoints
 from caliscope.core.process_synchronized_recording import (
@@ -33,6 +34,7 @@ from caliscope.task_manager.task_handle import TaskHandle
 from caliscope.task_manager.task_manager import TaskManager
 from caliscope.task_manager.task_state import TaskState
 from caliscope.tracker import Tracker
+from caliscope.trackers.aruco_tracker import ArucoTracker
 
 logger = logging.getLogger(__name__)
 
@@ -444,24 +446,43 @@ class MultiCameraProcessingPresenter(QObject):
 
         # --- Incremental coverage matrix update (cheap, every call) ---
         if self._coverage_matrix is not None:
-            # Collect which cameras saw each point_id at this sync_index
-            point_cameras: dict[int, list[int]] = {}
-            for cam_id, data in frame_data.items():
-                if data.points is not None and len(data.points.point_id) > 0:
-                    for pid in data.points.point_id:
-                        point_cameras.setdefault(int(pid), []).append(cam_id)
+            if self._uses_rigid_target_covisibility():
+                visible_cameras = []
+                for cam_id, data in frame_data.items():
+                    if (
+                        data.points is not None
+                        and data.points.obj_loc is not None
+                        and len(data.points.point_id) >= MIN_RIGID_TARGET_POINTS_PER_CAMERA
+                    ):
+                        visible_cameras.append(cam_id)
 
-            # Increment pairwise counts
-            for pid, cam_list in point_cameras.items():
-                cam_list_sorted = sorted(cam_list)
+                cam_list_sorted = sorted(set(visible_cameras))
                 for i, cam_id_i in enumerate(cam_list_sorted):
-                    for cam_id_j in cam_list_sorted[i:]:
-                        if cam_id_i in self._coverage_cam_id_to_index and cam_id_j in self._coverage_cam_id_to_index:
-                            idx_i = self._coverage_cam_id_to_index[cam_id_i]
-                            idx_j = self._coverage_cam_id_to_index[cam_id_j]
-                            self._coverage_matrix[idx_i, idx_j] += 1
-                            if idx_i != idx_j:
-                                self._coverage_matrix[idx_j, idx_i] += 1
+                    idx_i = self._coverage_cam_id_to_index[cam_id_i]
+                    self._coverage_matrix[idx_i, idx_i] += 1
+                    for cam_id_j in cam_list_sorted[i + 1 :]:
+                        idx_j = self._coverage_cam_id_to_index[cam_id_j]
+                        self._coverage_matrix[idx_i, idx_j] += 1
+                        self._coverage_matrix[idx_j, idx_i] += 1
+            else:
+                # Collect which cameras saw each point_id at this sync_index
+                point_cameras: dict[int, list[int]] = {}
+                for cam_id, data in frame_data.items():
+                    if data.points is not None and len(data.points.point_id) > 0:
+                        for pid in data.points.point_id:
+                            point_cameras.setdefault(int(pid), []).append(cam_id)
+
+                # Increment pairwise counts
+                for cam_list in point_cameras.values():
+                    cam_list_sorted = sorted(cam_list)
+                    for i, cam_id_i in enumerate(cam_list_sorted):
+                        for cam_id_j in cam_list_sorted[i:]:
+                            if cam_id_i in self._coverage_cam_id_to_index and cam_id_j in self._coverage_cam_id_to_index:
+                                idx_i = self._coverage_cam_id_to_index[cam_id_i]
+                                idx_j = self._coverage_cam_id_to_index[cam_id_j]
+                                self._coverage_matrix[idx_i, idx_j] += 1
+                                if idx_i != idx_j:
+                                    self._coverage_matrix[idx_j, idx_i] += 1
 
         # --- Emit coverage snapshot (throttled) ---
         if now - self._last_coverage_time >= self.COVERAGE_INTERVAL:
@@ -516,6 +537,14 @@ class MultiCameraProcessingPresenter(QObject):
         self._coverage_matrix = None
         self._coverage_cam_ids = []
         self._coverage_cam_id_to_index = {}
+
+    def _uses_rigid_target_covisibility(self) -> bool:
+        """Whether live coverage should count same-sync rigid-target visibility instead of shared point IDs."""
+        return (
+            isinstance(self._tracker, ArucoTracker)
+            and self._tracker.aruco_target is not None
+            and self._tracker.aruco_target.is_cube
+        )
 
     def _emit_state_changed(self) -> None:
         """Emit state_changed signal with current computed state."""

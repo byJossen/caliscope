@@ -62,6 +62,10 @@ class QualityPanel(QWidget):
         self._obs_label.setStyleSheet("color: #ccc;")
         reproj_layout.addWidget(self._obs_label)
 
+        self._raw_support_label = QLabel("Raw Pair Support: --")
+        self._raw_support_label.setStyleSheet("color: #ccc;")
+        reproj_layout.addWidget(self._raw_support_label)
+
         self._points_label = QLabel("3D Points: --")
         self._points_label.setStyleSheet("color: #ccc;")
         reproj_layout.addWidget(self._points_label)
@@ -147,7 +151,18 @@ class QualityPanel(QWidget):
             data: Quality metrics from the presenter
         """
         self._rmse_label.setText(f"RMSE: {data.overall_rmse:.3f} px")
-        self._obs_label.setText(f"Observations: {data.n_observations:,}")
+        if data.raw_observations_total is not None:
+            self._obs_label.setText(
+                f"Matched Obs: {data.n_observations:,} / Raw 2D: {data.raw_observations_total:,}"
+            )
+        else:
+            self._obs_label.setText(f"Matched Obs: {data.n_observations:,}")
+
+        if data.raw_pairwise_support is not None:
+            self._raw_support_label.setText(f"Raw Pair Support: {data.raw_pairwise_support:,}")
+        else:
+            self._raw_support_label.setText("Raw Pair Support: --")
+
         self._points_label.setText(f"3D Points: {data.n_world_points:,}")
 
         status = "Yes" if data.converged else "No"
@@ -197,7 +212,8 @@ class QualityPanel(QWidget):
     def clear(self) -> None:
         """Reset all displays to placeholder values."""
         self._rmse_label.setText("RMSE: --")
-        self._obs_label.setText("Observations: --")
+        self._obs_label.setText("Matched Obs: --")
+        self._raw_support_label.setText("Raw Pair Support: --")
         self._points_label.setText("3D Points: --")
         self._converged_label.setText("Converged: --")
 

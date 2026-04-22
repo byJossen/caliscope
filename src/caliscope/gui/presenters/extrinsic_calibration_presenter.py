@@ -15,6 +15,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 
 import numpy as np
@@ -26,12 +27,19 @@ from caliscope.core.bootstrap_pose.build_paired_pose_network import (
 )
 from caliscope.core.coverage_analysis import compute_coverage_matrix
 from caliscope.core.point_data import ImagePoints
-from caliscope.core.capture_volume import CaptureVolume
+from caliscope.core.capture_volume import (
+    CaptureVolume,
+    rigid_target_point_id_to_obj,
+    estimate_target_pose_world_points_from_image_points,
+    supports_rigid_target_optimization,
+)
+from caliscope.core.reprojection_video import export_reprojection_overlay_videos
 from caliscope.repositories.project_settings_repository import ProjectSettingsRepository
 from caliscope.task_manager.cancellation import CancellationToken
 from caliscope.task_manager.task_handle import TaskHandle
 from caliscope.task_manager.task_manager import TaskManager
 from caliscope.task_manager.task_state import TaskState
+from caliscope.trackers.aruco_tracker import ArucoTracker
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +101,8 @@ class QualityPanelData:
     overall_rmse: float
     n_observations: int
     n_world_points: int
+    raw_pairwise_support: int | None
+    raw_observations_total: int | None
 
     # Per-camera table rows: (cam_id, n_obs, rmse)
     camera_rows: list[tuple[int, int, float]]
@@ -149,6 +159,7 @@ class ExtrinsicCalibrationPresenter(QObject):
         image_points_path: Path,
         existing_capture_volume: CaptureVolume | None = None,
         project_settings: ProjectSettingsRepository | None = None,
+        extrinsic_tracker=None,
         parent: QObject | None = None,
     ) -> None:
         """Initialize the presenter.
@@ -168,6 +179,7 @@ class ExtrinsicCalibrationPresenter(QObject):
         self._camera_array = camera_array
         self._image_points_path = image_points_path
         self._project_settings = project_settings
+        self._extrinsic_tracker = extrinsic_tracker
 
         # Processing state (managed internally)
         self._capture_volume: CaptureVolume | None = existing_capture_volume
@@ -179,15 +191,16 @@ class ExtrinsicCalibrationPresenter(QObject):
         # View state
         self._current_sync_index: int = 0
 
-        # Load image points for coverage display (from capture volume if available, else CSV)
-        if existing_capture_volume is not None:
+        # Always prefer the latest extracted image_points.csv for coverage display.
+        self._load_initial_image_points()
+        if self._initial_image_points is None and existing_capture_volume is not None:
             self._initial_image_points = existing_capture_volume.image_points
+
+        if existing_capture_volume is not None:
             # Set initial sync index from capture volume
             sync_indices = existing_capture_volume.unique_sync_indices
             if len(sync_indices) > 0:
                 self._current_sync_index = int(sync_indices[0])
-        else:
-            self._load_initial_image_points()
 
     # -------------------------------------------------------------------------
     # Public Properties
@@ -312,17 +325,36 @@ class ExtrinsicCalibrationPresenter(QObject):
         if token.is_cancelled:
             raise InterruptedError("Calibration cancelled")
 
-        handle.report_progress(30, "Triangulating 3D points")
-        world_points = image_points.triangulate(camera_array)
+        if supports_rigid_target_optimization(image_points):
+            handle.report_progress(30, "Estimating rigid target poses")
+            point_id_to_obj = rigid_target_point_id_to_obj(image_points)
+            world_points = estimate_target_pose_world_points_from_image_points(
+                camera_array,
+                image_points,
+                point_id_to_obj,
+            )
+            valid_sync_indices = set(int(sync_index) for sync_index in world_points.df["sync_index"].unique())
+            image_points_for_capture = ImagePoints(
+                image_points.df[image_points.df["sync_index"].isin(valid_sync_indices)].copy()
+            )
+        else:
+            handle.report_progress(30, "Triangulating 3D points")
+            world_points = image_points.triangulate(camera_array)
+            image_points_for_capture = image_points
 
         handle.report_progress(40, "Building capture volume")
-        capture_volume = CaptureVolume(camera_array, image_points, world_points)
+        capture_volume = CaptureVolume(camera_array, image_points_for_capture, world_points)
 
         if token.is_cancelled:
             raise InterruptedError("Calibration cancelled")
 
         handle.report_progress(50, "Running initial optimization")
-        optimized = capture_volume.optimize(ftol=1e-8, verbose=0)
+        optimized = self._optimize_capture_volume(
+            capture_volume,
+            handle=handle,
+            stage_label="Initial optimization",
+            progress_range=(50, 74),
+        )
         logger.info(f"Initial optimization RMSE: {optimized.reprojection_report.overall_rmse:.3f}px")
 
         if token.is_cancelled:
@@ -335,8 +367,25 @@ class ExtrinsicCalibrationPresenter(QObject):
             raise InterruptedError("Calibration cancelled")
 
         handle.report_progress(85, "Final optimization")
-        final = filtered.optimize(ftol=1e-8, verbose=0)
+        final = self._optimize_capture_volume(
+            filtered,
+            handle=handle,
+            stage_label="Final optimization",
+            progress_range=(85, 94),
+        )
         logger.info(f"Final optimization RMSE: {final.reprojection_report.overall_rmse:.3f}px")
+
+        if self._project_settings is not None and self._project_settings.get_save_tracked_points_video():
+            handle.report_progress(95, "Exporting reprojection overlay videos")
+            try:
+                self._export_reprojection_videos(
+                    capture_volume=final,
+                    recording_dir=image_points_path.parent.parent,
+                    output_dir=image_points_path.parent / "reprojection_videos",
+                    handle=handle,
+                )
+            except Exception as exc:
+                logger.warning(f"Reprojection overlay export failed, continuing without videos: {exc}")
 
         handle.report_progress(100, "Complete")
         return final
@@ -430,7 +479,11 @@ class ExtrinsicCalibrationPresenter(QObject):
         if self._capture_volume is None:
             return
 
-        aligned = self._capture_volume.align_to_object(sync_index)
+        aligned = self._capture_volume.align_to_object(
+            sync_index,
+            world_points=self._active_world_points(),
+            image_points=self._active_image_points(),
+        )
         logger.info(f"Aligned world origin to object at sync_index={sync_index}")
 
         self._update_capture_volume(aligned)
@@ -453,7 +506,7 @@ class ExtrinsicCalibrationPresenter(QObject):
             return
 
         # Clamp to valid range
-        sync_indices = self._capture_volume.unique_sync_indices
+        sync_indices = self._active_sync_indices()
         if len(sync_indices) == 0:
             return
 
@@ -519,6 +572,56 @@ class ExtrinsicCalibrationPresenter(QObject):
             logger.info("Cancel requested by user")
             self._task_handle.cancel()
 
+    def export_reprojection_videos(self) -> None:
+        """Rebuild reprojection overlay videos from the current calibrated capture volume."""
+        if self._capture_volume is None or self._extrinsic_tracker is None:
+            logger.warning("Cannot export reprojection videos without a calibrated capture volume and tracker")
+            return
+        if self._is_task_active():
+            logger.warning("Cannot export reprojection videos: task already running")
+            return
+
+        capture_volume = self._capture_volume
+        recording_dir = self._image_points_path.parent.parent
+        output_dir = self._image_points_path.parent / "reprojection_videos"
+
+        def worker(token: CancellationToken, handle: TaskHandle) -> None:
+            if token.is_cancelled:
+                raise InterruptedError("Reprojection export cancelled")
+            handle.report_progress(5, "Preparing reprojection overlay export")
+            self._export_reprojection_videos(
+                capture_volume=capture_volume,
+                recording_dir=recording_dir,
+                output_dir=output_dir,
+                handle=handle,
+            )
+            handle.report_progress(100, "Reprojection videos exported")
+            return None
+
+        self._task_handle = self._task_manager.submit(
+            worker,
+            name="Reprojection video export",
+            auto_start=False,
+        )
+        self._task_handle.completed.connect(
+            self._on_reprojection_export_completed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._task_handle.failed.connect(
+            self._on_calibration_failed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._task_handle.cancelled.connect(
+            self._on_calibration_cancelled,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._task_handle.progress_updated.connect(
+            self.progress_updated,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._task_manager.start_task(self._task_handle.task_id)
+        self._emit_state_changed()
+
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
@@ -564,6 +667,12 @@ class ExtrinsicCalibrationPresenter(QObject):
         self._task_handle = None
         self._emit_state_changed()
 
+    def _on_reprojection_export_completed(self, _result: object) -> None:
+        """Handle successful completion of reprojection video export."""
+        logger.info("Reprojection video export complete")
+        self._task_handle = None
+        self._emit_state_changed()
+
     # -------------------------------------------------------------------------
     # Private: State Management
     # -------------------------------------------------------------------------
@@ -581,6 +690,9 @@ class ExtrinsicCalibrationPresenter(QObject):
 
         report = self._capture_volume.reprojection_report
         status = self._capture_volume.optimization_status
+        raw_image_points = self._initial_image_points or self._capture_volume.image_points
+        raw_pairwise_support = self._compute_pairwise_support(raw_image_points)
+        raw_observations_total = len(raw_image_points.df) if raw_image_points is not None else None
 
         # Build per-camera rows: (cam_id, n_obs, rmse)
         camera_rows: list[tuple[int, int, float]] = []
@@ -593,6 +705,8 @@ class ExtrinsicCalibrationPresenter(QObject):
             overall_rmse=report.overall_rmse,
             n_observations=report.n_observations_matched,
             n_world_points=report.n_points,
+            raw_pairwise_support=raw_pairwise_support,
+            raw_observations_total=raw_observations_total,
             camera_rows=camera_rows,
             converged=status.converged if status else False,
             iterations=status.iterations if status else 0,
@@ -607,11 +721,17 @@ class ExtrinsicCalibrationPresenter(QObject):
             return
 
         # Import here to avoid circular dependency at module level
+        from caliscope.gui.geometry.wireframe import wireframe_segments_from_view
         from caliscope.gui.view_models.playback_view_model import PlaybackViewModel
+
+        wireframe_segments = None
+        if self._extrinsic_tracker is not None and self._extrinsic_tracker.wireframe is not None:
+            wireframe_segments = wireframe_segments_from_view(self._extrinsic_tracker.wireframe)
 
         view_model = PlaybackViewModel(
             camera_array=self._capture_volume.camera_array,
-            world_points=self._capture_volume.world_points,
+            world_points=self._active_world_points(),
+            wireframe_segments=wireframe_segments,
         )
         self.view_model_updated.emit(view_model)
 
@@ -625,13 +745,44 @@ class ExtrinsicCalibrationPresenter(QObject):
         if self._capture_volume is None:
             return
 
-        report = self._capture_volume.compute_volumetric_scale_accuracy()
+        report = self._capture_volume.compute_volumetric_scale_accuracy(
+            world_points=self._active_world_points(),
+            image_points=self._active_image_points(),
+        )
         if report.n_frames_sampled > 0:
             logger.info(
                 f"Volumetric scale accuracy: pooled RMSE={report.pooled_rmse_mm:.2f}mm, "
                 f"{report.n_frames_sampled} frames sampled"
             )
         self.volumetric_accuracy_updated.emit(report)
+
+    def _cube_point_id_to_obj(self) -> dict[int, np.ndarray]:
+        """Corner object coordinates for cube-like ArUco targets."""
+        if not isinstance(self._extrinsic_tracker, ArucoTracker) or self._extrinsic_tracker.aruco_target is None:
+            return {}
+        return {
+            marker_id * 10 + corner_index: corner.astype(np.float64)
+            for marker_id, corners in self._extrinsic_tracker.aruco_target.corners.items()
+            for corner_index, corner in enumerate(corners)
+        }
+
+    def _active_image_points(self) -> ImagePoints:
+        """Image points used by the calibrated Capture Volume view."""
+        assert self._capture_volume is not None
+        return self._capture_volume.image_points
+
+    def _active_world_points(self):
+        """World points used by the calibrated Capture Volume view."""
+        assert self._capture_volume is not None
+        return self._capture_volume.world_points
+
+    def _active_sync_indices(self) -> np.ndarray:
+        """Sync indices currently available in the preview world-point set."""
+        if self._capture_volume is None:
+            return np.array([], dtype=np.int64)
+        world_points = self._active_world_points()
+        indices = world_points.df["sync_index"].unique() if len(world_points.df) > 0 else []
+        return np.sort(np.array(indices, dtype=np.int64))
 
     def _load_initial_image_points(self) -> None:
         """Load ImagePoints for initial coverage display.
@@ -645,6 +796,37 @@ class ExtrinsicCalibrationPresenter(QObject):
         except Exception as e:
             logger.warning(f"Could not load initial image points: {e}")
             self._initial_image_points = None
+
+    def _export_reprojection_videos(
+        self,
+        *,
+        capture_volume: CaptureVolume,
+        recording_dir: Path,
+        output_dir: Path,
+        handle: TaskHandle | None = None,
+    ) -> None:
+        """Export projected-target overlays for post-calibration debugging."""
+        if self._extrinsic_tracker is None:
+            return
+
+        export_reprojection_overlay_videos(
+            recording_dir=recording_dir,
+            output_dir=output_dir,
+            capture_volume=capture_volume,
+            tracker=self._extrinsic_tracker,
+            image_points=capture_volume.image_points,
+            world_points=capture_volume.world_points,
+            progress_callback=self._make_reprojection_export_progress_callback(handle) if handle is not None else None,
+        )
+
+    def _make_reprojection_export_progress_callback(self, handle: TaskHandle):
+        """Create progress updates for reprojection video export."""
+        def callback(current: int, total: int) -> None:
+            total = max(total, 1)
+            percent = 5 + int(round(95 * min(max(current, 0), total) / total))
+            handle.report_progress(percent, f"Exporting reprojection overlays: {current}/{total} frames")
+
+        return callback
 
     def emit_initial_state(self) -> None:
         """Emit initial state for UI display after signal connections.
@@ -678,6 +860,7 @@ class ExtrinsicCalibrationPresenter(QObject):
         Internal method - use emit_initial_state() from the view.
         Uses cam_ids discovered from ImagePoints data (not posed cameras).
         """
+        self._load_initial_image_points()
         if self._initial_image_points is None:
             return
 
@@ -694,23 +877,49 @@ class ExtrinsicCalibrationPresenter(QObject):
 
         self.coverage_updated.emit(coverage, labels)
 
+    def _compute_pairwise_support(self, image_points: ImagePoints | None) -> int | None:
+        """Aggregate pairwise support from the current raw image points."""
+        if image_points is None:
+            return None
+
+        df = image_points.df
+        if len(df) == 0:
+            return 0
+
+        actual_cam_ids = sorted(int(cam_id) for cam_id in df["cam_id"].unique())
+        if len(actual_cam_ids) < 2:
+            return 0
+
+        coverage = compute_coverage_matrix(
+            image_points,
+            {cam_id: idx for idx, cam_id in enumerate(actual_cam_ids)},
+        )
+        return int(np.triu(coverage, k=1).sum())
+
     def _refresh_coverage(self) -> None:
         """Emit coverage matrix data for heatmap visualization.
 
         Computes pairwise observation counts between all posed cameras.
         Labels use camera IDs (C1, C2, etc.) matching the camera array.
         """
-        if self._capture_volume is None:
+        if self._capture_volume is None and self._initial_image_points is None:
             return
 
-        camera_array = self._capture_volume.camera_array
+        camera_array = self._capture_volume.camera_array if self._capture_volume is not None else self._camera_array
         cam_id_to_index = camera_array.posed_cam_id_to_index
 
         if not cam_id_to_index:
             logger.debug("No posed cameras for coverage matrix")
             return
 
-        coverage = compute_coverage_matrix(self._capture_volume.image_points, cam_id_to_index)
+        self._load_initial_image_points()
+        image_points = self._initial_image_points
+        if image_points is None and self._capture_volume is not None:
+            image_points = self._capture_volume.image_points
+        if image_points is None:
+            return
+
+        coverage = compute_coverage_matrix(image_points, cam_id_to_index)
         labels = [f"C{c}" for c in sorted(cam_id_to_index.keys())]
 
         self.coverage_updated.emit(coverage, labels)
@@ -731,7 +940,12 @@ class ExtrinsicCalibrationPresenter(QObject):
 
         def worker(token: CancellationToken, handle: TaskHandle) -> CaptureVolume:
             handle.report_progress(10, "Running optimization")
-            optimized = capture_volume.optimize(ftol=1e-8, verbose=0)
+            optimized = self._optimize_capture_volume(
+                capture_volume,
+                handle=handle,
+                stage_label="Optimization",
+                progress_range=(10, 99),
+            )
             handle.report_progress(100, "Complete")
             logger.info(f"Post-filter optimization RMSE: {optimized.reprojection_report.overall_rmse:.3f}px")
             return optimized
@@ -773,3 +987,159 @@ class ExtrinsicCalibrationPresenter(QObject):
         self._refresh_view_model()
         self._refresh_volumetric_accuracy()
         self.capture_volume_changed.emit(capture_volume)
+
+    def _optimize_capture_volume(
+        self,
+        capture_volume: CaptureVolume,
+        *,
+        handle: TaskHandle | None = None,
+        stage_label: str = "Optimization",
+        progress_range: tuple[int, int] = (0, 100),
+    ) -> CaptureVolume:
+        """Choose the correct optimizer for the current target geometry."""
+        max_nfev = 1000
+
+        if supports_rigid_target_optimization(capture_volume.image_points):
+            stage_progress_callback = None
+            solver_progress_callback = None
+            if handle is not None:
+                start_percent, end_percent = progress_range
+                span = max(end_percent - start_percent, 1)
+                preparation_end_percent = min(
+                    end_percent - 1,
+                    start_percent + max(1, int(round(span * 0.65))),
+                )
+                if preparation_end_percent <= start_percent:
+                    preparation_end_percent = end_percent
+
+                stage_progress_callback = self._make_stage_progress_callback(
+                    handle,
+                    stage_label=f"{stage_label}: preparing cube optimization",
+                    progress_range=(start_percent, preparation_end_percent),
+                )
+                solver_progress_callback = self._make_optimization_progress_callback(
+                    handle,
+                    stage_label=stage_label,
+                    progress_range=(preparation_end_percent, end_percent),
+                    max_nfev=max_nfev,
+                )
+
+            optimized = capture_volume.optimize_rigid_target(
+                ftol=1e-8,
+                verbose=0,
+                strict=False,
+                max_nfev=max_nfev,
+                progress_callback=solver_progress_callback,
+                stage_progress_callback=stage_progress_callback,
+            )
+            status = optimized.optimization_status
+            if status is not None and not status.converged:
+                logger.warning(
+                    "Rigid-target optimization stopped before convergence (%s after %s evaluations); "
+                    "continuing with the best available solution",
+                    status.termination_reason,
+                    status.iterations,
+                )
+            return optimized
+        progress_callback = None
+        if handle is not None:
+            progress_callback = self._make_optimization_progress_callback(
+                handle,
+                stage_label=stage_label,
+                progress_range=progress_range,
+                max_nfev=max_nfev,
+            )
+        return capture_volume.optimize(
+            ftol=1e-8,
+            verbose=0,
+            max_nfev=max_nfev,
+            progress_callback=progress_callback,
+        )
+
+    def _make_stage_progress_callback(
+        self,
+        handle: TaskHandle,
+        *,
+        stage_label: str,
+        progress_range: tuple[int, int],
+    ):
+        """Create a throttled progress callback for pre-solver setup stages."""
+        start_percent, end_percent = progress_range
+        span = max(end_percent - start_percent, 1)
+        last_emit_percent = -1
+        last_emit_message = ""
+        last_emit_time = monotonic()
+
+        def callback(fraction: float, message: str) -> None:
+            nonlocal last_emit_percent, last_emit_message, last_emit_time
+
+            clamped_fraction = max(0.0, min(1.0, float(fraction)))
+            overall_percent = min(end_percent, start_percent + int(round(span * clamped_fraction)))
+            now = monotonic()
+            if (
+                overall_percent == last_emit_percent
+                and message == last_emit_message
+                and now - last_emit_time < 0.4
+            ):
+                return
+
+            handle.report_progress(overall_percent, f"{stage_label}: {message}")
+            last_emit_percent = overall_percent
+            last_emit_message = message
+            last_emit_time = now
+
+        return callback
+
+    def _make_optimization_progress_callback(
+        self,
+        handle: TaskHandle,
+        *,
+        stage_label: str,
+        progress_range: tuple[int, int],
+        max_nfev: int,
+    ):
+        """Create a throttled progress callback for scipy least_squares iterations."""
+        start_percent, end_percent = progress_range
+        span = max(end_percent - start_percent, 1)
+        started_at = monotonic()
+        last_emit_nfev = -1
+        last_emit_percent = -1
+        last_emit_time = started_at
+
+        def callback(nfev: int, cost: float) -> None:
+            nonlocal last_emit_nfev, last_emit_percent, last_emit_time
+
+            clamped_nfev = max(0, min(int(nfev), max_nfev))
+            stage_percent = int(round(100.0 * clamped_nfev / max_nfev))
+            overall_percent = min(end_percent, start_percent + int(round(span * clamped_nfev / max_nfev)))
+            now = monotonic()
+
+            if (
+                clamped_nfev == last_emit_nfev
+                or (overall_percent == last_emit_percent and now - last_emit_time < 0.4)
+            ):
+                return
+
+            eta_text = ""
+            if clamped_nfev > 0:
+                elapsed = now - started_at
+                remaining_evals = max_nfev - clamped_nfev
+                remaining_seconds = elapsed * remaining_evals / clamped_nfev
+                minutes = int(remaining_seconds // 60)
+                seconds = int(round(remaining_seconds % 60))
+                eta_text = f" — ~{minutes}:{seconds:02d} remaining"
+
+            message = (
+                f"{stage_label}: {clamped_nfev}/{max_nfev} evals "
+                f"({stage_percent}%)"
+            )
+            if np.isfinite(cost):
+                message += f" cost {cost:.3g}"
+            message += eta_text
+
+            handle.report_progress(overall_percent, message)
+            last_emit_nfev = clamped_nfev
+            last_emit_percent = overall_percent
+            last_emit_time = now
+
+        return callback

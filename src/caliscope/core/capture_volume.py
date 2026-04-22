@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable, Literal
 import logging
 
-from caliscope.cameras.camera_array import CameraArray
+from caliscope.cameras.camera_array import CameraArray, CameraData
 from caliscope.core.point_data import WORLD_POINT_COLUMNS, ImagePoints, WorldPoints
 from caliscope.core.reprojection import (
     ErrorsXY,
@@ -46,6 +46,7 @@ logger = logging.getLogger(__file__)
 
 OptimizationProgressCallback = Callable[[int, float], None]
 StageProgressCallback = Callable[[float, str], None]
+RigidTargetPoseEstimationMethod = Literal["geometry_aware", "opencv_board"]
 
 
 @dataclass(frozen=True)
@@ -137,12 +138,211 @@ def _rigid_target_characteristic_scale(point_id_to_obj: dict[int, NDArray[np.flo
     return float(np.max(distances))
 
 
+def _build_opencv_board_from_point_id_to_obj(
+    point_id_to_obj: dict[int, NDArray[np.float64]],
+) -> cv2.aruco.Board | None:
+    """Build an OpenCV ArUco board from rigid-target corner coordinates."""
+    marker_to_corners: dict[int, dict[int, NDArray[np.float64]]] = {}
+    for point_id, obj_point in point_id_to_obj.items():
+        marker_id = int(point_id) // 10
+        corner_index = int(point_id) % 10
+        if 0 <= corner_index < 4:
+            marker_to_corners.setdefault(marker_id, {})[corner_index] = np.asarray(obj_point, dtype=np.float64)
+
+    object_points: list[NDArray[np.float32]] = []
+    marker_ids: list[int] = []
+    for marker_id in sorted(marker_to_corners):
+        corners_by_index = marker_to_corners[marker_id]
+        if set(corners_by_index) != {0, 1, 2, 3}:
+            continue
+        object_points.append(
+            np.asarray([corners_by_index[index] for index in range(4)], dtype=np.float32)
+        )
+        marker_ids.append(marker_id)
+
+    if not marker_ids:
+        return None
+
+    # The dictionary is only needed to instantiate cv2.aruco.Board; pose
+    # estimation matches by marker IDs and the supplied 3D corner coordinates.
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_100)
+    return cv2.aruco.Board(
+        object_points,
+        dictionary,
+        np.asarray(marker_ids, dtype=np.int32).reshape(-1, 1),
+    )
+
+
+def _marker_corners_and_ids_from_group(group: pd.DataFrame) -> tuple[list[NDArray[np.float32]], NDArray[np.int32]]:
+    """Reconstruct OpenCV marker-level corners and IDs from point-level rows."""
+    marker_to_corners: dict[int, dict[int, tuple[float, float]]] = {}
+    for row in group.itertuples(index=False):
+        point_id = int(row.point_id)
+        marker_id = point_id // 10
+        corner_index = point_id % 10
+        if 0 <= corner_index < 4:
+            marker_to_corners.setdefault(marker_id, {})[corner_index] = (
+                float(row.img_loc_x),
+                float(row.img_loc_y),
+            )
+
+    corners: list[NDArray[np.float32]] = []
+    marker_ids: list[int] = []
+    for marker_id in sorted(marker_to_corners):
+        corners_by_index = marker_to_corners[marker_id]
+        if set(corners_by_index) != {0, 1, 2, 3}:
+            continue
+        marker_corners = np.asarray([corners_by_index[index] for index in range(4)], dtype=np.float32)
+        corners.append(marker_corners.reshape(1, 4, 2))
+        marker_ids.append(marker_id)
+
+    return corners, np.asarray(marker_ids, dtype=np.int32).reshape(-1, 1)
+
+
+def _board_match_image_points(
+    board: cv2.aruco.Board,
+    corners: list[NDArray[np.float32]],
+    ids: NDArray[np.int32],
+) -> tuple[NDArray[np.float32], NDArray[np.float32]] | None:
+    """Return matched board object/image points in flat OpenCV solvePnP shape."""
+    if len(corners) == 0 or ids.size == 0:
+        return None
+
+    try:
+        obj_points, img_points = board.matchImagePoints(corners, ids)
+    except cv2.error as exc:
+        logger.debug("OpenCV board matchImagePoints failed: %s", exc)
+        return None
+
+    obj_points = np.asarray(obj_points, dtype=np.float32).reshape(-1, 3)
+    img_points = np.asarray(img_points, dtype=np.float32).reshape(-1, 2)
+    if len(obj_points) < 4 or len(img_points) != len(obj_points):
+        return None
+    return obj_points, img_points
+
+
+def _opencv_board_solve_inputs(
+    camera: CameraData,
+    corners: list[NDArray[np.float32]],
+) -> tuple[list[NDArray[np.float32]], NDArray[np.float64], NDArray[np.float64]] | None:
+    """Prepare marker corners and intrinsics for OpenCV board pose solving."""
+    if camera.matrix is None or camera.distortions is None:
+        return None
+
+    if camera.uses_fisheye_model:
+        undistorted_corners = [
+            camera.undistort_points(corner.reshape(-1, 2), output="normalized")
+            .astype(np.float32)
+            .reshape(1, 4, 2)
+            for corner in corners
+        ]
+        return undistorted_corners, np.identity(3, dtype=np.float64), np.zeros(5, dtype=np.float64)
+
+    return (
+        corners,
+        np.asarray(camera.matrix, dtype=np.float64),
+        np.asarray(camera.distortions, dtype=np.float64).reshape(-1),
+    )
+
+
+def _estimate_pose_with_opencv_board_api(
+    board: cv2.aruco.Board,
+    corners: list[NDArray[np.float32]],
+    ids: NDArray[np.int32],
+    camera_matrix: NDArray[np.float64],
+    dist_coeffs: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+    """Call cv2.aruco.estimatePoseBoard when the installed OpenCV exposes it."""
+    estimate_pose_board = getattr(cv2.aruco, "estimatePoseBoard", None)
+    if estimate_pose_board is None:
+        return None
+
+    rvec_guess = np.zeros((3, 1), dtype=np.float64)
+    tvec_guess = np.zeros((3, 1), dtype=np.float64)
+    try:
+        result = estimate_pose_board(corners, ids, board, camera_matrix, dist_coeffs, rvec_guess, tvec_guess)
+    except (TypeError, cv2.error) as exc:
+        logger.debug("OpenCV estimatePoseBoard failed: %s", exc)
+        return None
+
+    if not isinstance(result, tuple) or len(result) < 3:
+        return None
+
+    retval, rvec, tvec = result[:3]
+    retval_array = np.asarray(retval).reshape(-1)
+    if retval_array.size == 0 or float(retval_array[0]) <= 0.0:
+        return None
+
+    return (
+        np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+        np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+    )
+
+
+def _solve_target_pose_with_opencv_board(
+    *,
+    board: cv2.aruco.Board,
+    corners: list[NDArray[np.float32]],
+    ids: NDArray[np.int32],
+    camera: CameraData,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float] | None:
+    """Estimate object-to-camera pose with an OpenCV ArUco board baseline."""
+    solve_inputs = _opencv_board_solve_inputs(camera, corners)
+    if solve_inputs is None:
+        return None
+    solve_corners, camera_matrix, dist_coeffs = solve_inputs
+
+    pose = _estimate_pose_with_opencv_board_api(board, solve_corners, ids, camera_matrix, dist_coeffs)
+    if pose is None:
+        matched = _board_match_image_points(board, solve_corners, ids)
+        if matched is None:
+            return None
+        solve_obj_points, solve_img_points = matched
+        try:
+            success, rvec, tvec = cv2.solvePnP(
+                solve_obj_points,
+                solve_img_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except cv2.error as exc:
+            logger.debug("OpenCV board solvePnP fallback failed: %s", exc)
+            return None
+        if not success:
+            return None
+        pose = (
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            np.asarray(tvec, dtype=np.float64).reshape(3, 1),
+        )
+
+    rvec, tvec = pose
+    rotation_obj_to_cam, _ = cv2.Rodrigues(rvec)
+    translation_obj_to_cam = np.asarray(tvec, dtype=np.float64).reshape(3)
+
+    matched_for_error = _board_match_image_points(board, corners, ids)
+    if matched_for_error is None:
+        return None
+    obj_points, img_points = matched_for_error
+    undistorted = camera.undistort_points(img_points, output="normalized")
+    projected, _ = cv2.projectPoints(
+        obj_points,
+        rvec,
+        tvec,
+        np.identity(3, dtype=np.float64),
+        np.zeros(5, dtype=np.float64),
+    )
+    rmse = float(np.sqrt(np.mean(np.sum((undistorted - projected.reshape(-1, 2)) ** 2, axis=1))))
+    return rotation_obj_to_cam, translation_obj_to_cam, rmse
+
+
 def _estimate_target_pose_world_pose_candidates(
     camera_array: CameraArray,
     image_points: ImagePoints,
     point_id_to_obj: dict[int, NDArray[np.float64]],
     *,
     min_points: int = 4,
+    pose_estimation_method: RigidTargetPoseEstimationMethod = "geometry_aware",
 ) -> dict[int, list[RigidPoseEstimate]]:
     """Estimate one rigid-target world pose candidate per camera/sync group.
 
@@ -163,6 +363,11 @@ def _estimate_target_pose_world_pose_candidates(
     D_perfect = np.zeros(5)
     pose_candidates_by_sync: dict[int, list[RigidPoseEstimate]] = {}
     marker_face_geometry = _marker_face_geometry_from_point_ids(point_id_to_obj)
+    opencv_board = None
+    if pose_estimation_method == "opencv_board":
+        opencv_board = _build_opencv_board_from_point_id_to_obj(point_id_to_obj)
+        if opencv_board is None:
+            return {}
 
     for (cam_id, sync_index), group in target_df.groupby(["cam_id", "sync_index"]):
         if cam_id not in posed_cameras:
@@ -176,19 +381,32 @@ def _estimate_target_pose_world_pose_candidates(
         if len(group) < min_points:
             continue
 
-        img_points = group[["img_loc_x", "img_loc_y"]].to_numpy(dtype=np.float32)
-        undistorted = camera.undistort_points(img_points, output="normalized")
-        obj_points = np.array([point_id_to_obj[int(pid)] for pid in group["point_id"]], dtype=np.float32)
-        point_ids = group["point_id"].to_numpy(dtype=np.int32)
+        if pose_estimation_method == "geometry_aware":
+            img_points = group[["img_loc_x", "img_loc_y"]].to_numpy(dtype=np.float32)
+            undistorted = camera.undistort_points(img_points, output="normalized")
+            obj_points = np.array([point_id_to_obj[int(pid)] for pid in group["point_id"]], dtype=np.float32)
+            point_ids = group["point_id"].to_numpy(dtype=np.int32)
 
-        solved = _solve_target_pose_from_normalized_correspondences(
-            obj_points=obj_points,
-            undistorted_img_points=undistorted,
-            perfect_camera_matrix=K_perfect,
-            zero_distortion=D_perfect,
-            point_ids=point_ids,
-            marker_face_geometry=marker_face_geometry,
-        )
+            solved = _solve_target_pose_from_normalized_correspondences(
+                obj_points=obj_points,
+                undistorted_img_points=undistorted,
+                perfect_camera_matrix=K_perfect,
+                zero_distortion=D_perfect,
+                point_ids=point_ids,
+                marker_face_geometry=marker_face_geometry,
+            )
+        elif pose_estimation_method == "opencv_board":
+            assert opencv_board is not None
+            corners, ids = _marker_corners_and_ids_from_group(group)
+            solved = _solve_target_pose_with_opencv_board(
+                board=opencv_board,
+                corners=corners,
+                ids=ids,
+                camera=camera,
+            )
+        else:
+            raise ValueError(f"Unknown rigid-target pose estimation method: {pose_estimation_method}")
+
         if solved is None:
             continue
 
@@ -611,6 +829,7 @@ def estimate_target_pose_world_poses(
     point_id_to_obj: dict[int, NDArray[np.float64]],
     *,
     min_points: int = 4,
+    pose_estimation_method: RigidTargetPoseEstimationMethod = "geometry_aware",
     max_translation_fraction: float = 0.45,
     min_translation_m: float = 0.03,
     max_rotation_deg: float = 35.0,
@@ -622,6 +841,7 @@ def estimate_target_pose_world_poses(
         image_points,
         point_id_to_obj,
         min_points=min_points,
+        pose_estimation_method=pose_estimation_method,
     )
     filtered_candidates_by_sync = _filter_pose_estimates_by_cross_camera_agreement(
         pose_candidates_by_sync,
@@ -876,6 +1096,7 @@ def estimate_target_pose_world_points_from_image_points(
     point_id_to_obj: dict[int, NDArray[np.float64]],
     *,
     min_points: int = 4,
+    pose_estimation_method: RigidTargetPoseEstimationMethod = "geometry_aware",
 ) -> WorldPoints:
     """Estimate cube world points directly from image observations.
 
@@ -888,6 +1109,7 @@ def estimate_target_pose_world_points_from_image_points(
         image_points,
         point_id_to_obj,
         min_points=min_points,
+        pose_estimation_method=pose_estimation_method,
     )
     return world_points_from_target_poses(point_id_to_obj, world_pose_estimates_by_sync)
 
@@ -1043,6 +1265,7 @@ class CaptureVolume:
         *,
         min_points: int = 4,
         image_points: ImagePoints | None = None,
+        pose_estimation_method: RigidTargetPoseEstimationMethod = "geometry_aware",
     ) -> WorldPoints:
         """Estimate full rigid-target world points from per-frame target poses.
 
@@ -1058,6 +1281,7 @@ class CaptureVolume:
             source_image_points,
             point_id_to_obj,
             min_points=min_points,
+            pose_estimation_method=pose_estimation_method,
         )
 
     def _validate_geometry(self):
@@ -1388,6 +1612,7 @@ class CaptureVolume:
         pose_diversity_rotation_scale_deg: float = 30.0,
         robust_loss: Literal["linear", "soft_l1", "huber", "cauchy", "arctan"] = "soft_l1",
         robust_loss_pixels: float = 2.5,
+        pose_estimation_method: RigidTargetPoseEstimationMethod = "geometry_aware",
     ) -> CaptureVolume:
         """Optimize camera extrinsics and one rigid target pose per selected sync index.
 
@@ -1412,7 +1637,16 @@ class CaptureVolume:
             raise ValueError("Rigid-target optimization requires at least 4 points with object coordinates")
 
         _report_stage_progress(0.08, "Estimating cube poses from camera observations")
-        pose_candidates_by_sync = self.rigid_target_pose_candidates_by_sync
+        if pose_estimation_method == "geometry_aware":
+            pose_candidates_by_sync = self.rigid_target_pose_candidates_by_sync
+        else:
+            pose_candidates_by_sync = _estimate_target_pose_world_pose_candidates(
+                self.camera_array,
+                self.image_points,
+                point_id_to_obj,
+                min_points=4,
+                pose_estimation_method=pose_estimation_method,
+            )
         if not pose_candidates_by_sync:
             raise ValueError("Could not initialize rigid target poses from image observations")
 

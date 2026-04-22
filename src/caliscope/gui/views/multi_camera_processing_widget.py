@@ -191,7 +191,7 @@ class MultiCameraProcessingWidget(QWidget):
 
         # Left: heatmap visualization
         heatmap_layout = QVBoxLayout()
-        heatmap_label = QLabel("Shared Point Observations")
+        heatmap_label = QLabel("Pairwise Calibration Coverage")
         heatmap_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         heatmap_label.setStyleSheet("color: #888; font-size: 11px; background: transparent;")
         heatmap_layout.addWidget(heatmap_label)

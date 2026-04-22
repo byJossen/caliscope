@@ -64,7 +64,7 @@ class ExtrinsicCalibrationView(QWidget):
        3. Rotation buttons (2x3 grid, left-aligned)
        4. Scale accuracy sparkline + expand button
        5. Quality panel (3 sections, evenly distributed)
-       6. Filter controls (at bottom)
+    6. Filter controls (at bottom)
     """
 
     def __init__(
@@ -214,11 +214,12 @@ class ExtrinsicCalibrationView(QWidget):
 
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
-        self._progress_bar.setFixedWidth(150)
+        self._progress_bar.setFormat("%p%")
+        self._progress_bar.setFixedWidth(180)
         progress_layout.addWidget(self._progress_bar)
 
         self._progress_label = QLabel("")
-        self._progress_label.setMinimumWidth(200)
+        self._progress_label.setMinimumWidth(340)
         progress_layout.addWidget(self._progress_label)
 
         layout.addWidget(self._progress_container)
@@ -238,6 +239,12 @@ class ExtrinsicCalibrationView(QWidget):
         self._coverage_btn.setEnabled(False)
         self._coverage_btn.setStyleSheet(Styles.GHOST_BUTTON)
         layout.addWidget(self._coverage_btn)
+
+        self._export_reprojection_btn = QPushButton("Export Reprojection")
+        self._export_reprojection_btn.setToolTip("Rebuild reprojection overlay videos from the current calibration")
+        self._export_reprojection_btn.setStyleSheet(Styles.GHOST_BUTTON)
+        self._export_reprojection_btn.setVisible(False)
+        layout.addWidget(self._export_reprojection_btn)
 
         return row
 
@@ -414,6 +421,7 @@ class ExtrinsicCalibrationView(QWidget):
         self._set_origin_btn.clicked.connect(self._on_set_origin_clicked)
         self._frame_slider.valueChanged.connect(self._on_frame_slider_changed)
         self._coverage_btn.clicked.connect(self._show_coverage_dialog)
+        self._export_reprojection_btn.clicked.connect(self._presenter.export_reprojection_videos)
 
         # Sparkline interactions (cursor sync happens in _on_frame_slider_changed, not direct connection)
         self._sparkline.frame_clicked.connect(self._on_sparkline_frame_clicked)
@@ -439,6 +447,7 @@ class ExtrinsicCalibrationView(QWidget):
 
         # Set Origin only visible when calibrated
         self._set_origin_btn.setVisible(has_capture_volume)
+        self._export_reprojection_btn.setVisible(has_capture_volume)
 
         # Progress only when running
         self._progress_container.setVisible(is_running)
@@ -454,6 +463,7 @@ class ExtrinsicCalibrationView(QWidget):
         controls_enabled = has_capture_volume and not is_running
         self._frame_slider.setEnabled(controls_enabled)
         self._filter_apply_btn.setEnabled(controls_enabled)
+        self._export_reprojection_btn.setEnabled(controls_enabled)
         self._filter_mode.setEnabled(controls_enabled)
         self._filter_value.setEnabled(controls_enabled)
         for btn in self._rotation_btns:
@@ -571,7 +581,8 @@ class ExtrinsicCalibrationView(QWidget):
 
     def _on_progress_updated(self, percent: int, message: str) -> None:
         """Handle progress update from presenter."""
-        self._progress_bar.setValue(percent)
+        self._progress_container.setVisible(True)
+        self._progress_bar.setValue(max(0, min(100, percent)))
         self._progress_label.setText(message)
 
     def _on_quality_updated(self, data: QualityPanelData) -> None:

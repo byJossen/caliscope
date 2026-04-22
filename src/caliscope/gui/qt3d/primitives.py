@@ -53,6 +53,58 @@ def numpy_to_qbytearray(arr: np.ndarray) -> QByteArray:
     return QByteArray(arr.astype(np.float32).tobytes())
 
 
+def _add_vertex_attribute(
+    geometry: Qt3DCore.QGeometry,
+    *,
+    name: str,
+    buffer: Qt3DCore.QBuffer,
+    vertex_size: int,
+    count: int,
+) -> Qt3DCore.QAttribute:
+    """Attach a float vertex attribute backed by the provided buffer."""
+    attr = Qt3DCore.QAttribute(geometry)
+    attr.setName(name)
+    attr.setVertexBaseType(Qt3DCore.QAttribute.VertexBaseType.Float)
+    attr.setVertexSize(vertex_size)
+    attr.setAttributeType(Qt3DCore.QAttribute.AttributeType.VertexAttribute)
+    attr.setBuffer(buffer)
+    attr.setByteStride(vertex_size * 4)
+    attr.setCount(count)
+    geometry.addAttribute(attr)
+    return attr
+
+
+def _dummy_normals(n_vertices: int) -> np.ndarray:
+    """Return a stable default normal buffer for unlit line geometry."""
+    normals = np.zeros((n_vertices, 3), dtype=np.float32)
+    normals[:, 2] = 1.0
+    return normals
+
+
+def _triangle_vertex_normals(vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Compute per-vertex normals for indexed triangle geometry."""
+    normals = np.zeros((len(vertices), 3), dtype=np.float32)
+    triangles = indices.reshape(-1, 3)
+
+    for a, b, c in triangles:
+        v0 = vertices[a]
+        v1 = vertices[b]
+        v2 = vertices[c]
+        face_normal = np.cross(v1 - v0, v2 - v0)
+        norm = np.linalg.norm(face_normal)
+        if norm > 1e-8:
+            face_normal = face_normal / norm
+            normals[a] += face_normal
+            normals[b] += face_normal
+            normals[c] += face_normal
+
+    lengths = np.linalg.norm(normals, axis=1)
+    valid = lengths > 1e-8
+    normals[valid] /= lengths[valid, None]
+    normals[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return normals.astype(np.float32)
+
+
 def create_line_entity(
     vertices: np.ndarray,
     indices: np.ndarray,
@@ -76,15 +128,23 @@ def create_line_entity(
     vertex_buf = Qt3DCore.QBuffer(geometry)
     vertex_buf.setData(numpy_to_qbytearray(vertices))
 
-    pos_attr = Qt3DCore.QAttribute(geometry)
-    pos_attr.setName(Qt3DCore.QAttribute.defaultPositionAttributeName())
-    pos_attr.setVertexBaseType(Qt3DCore.QAttribute.VertexBaseType.Float)
-    pos_attr.setVertexSize(3)
-    pos_attr.setAttributeType(Qt3DCore.QAttribute.AttributeType.VertexAttribute)
-    pos_attr.setBuffer(vertex_buf)
-    pos_attr.setByteStride(3 * 4)
-    pos_attr.setCount(len(vertices))
-    geometry.addAttribute(pos_attr)
+    _add_vertex_attribute(
+        geometry,
+        name=Qt3DCore.QAttribute.defaultPositionAttributeName(),
+        buffer=vertex_buf,
+        vertex_size=3,
+        count=len(vertices),
+    )
+
+    normal_buf = Qt3DCore.QBuffer(geometry)
+    normal_buf.setData(numpy_to_qbytearray(_dummy_normals(len(vertices))))
+    _add_vertex_attribute(
+        geometry,
+        name=Qt3DCore.QAttribute.defaultNormalAttributeName(),
+        buffer=normal_buf,
+        vertex_size=3,
+        count=len(vertices),
+    )
 
     index_data = indices.astype(np.uint32)
     index_buf = Qt3DCore.QBuffer(geometry)
@@ -129,15 +189,23 @@ def create_double_sided_mesh(
     vertex_buf = Qt3DCore.QBuffer(geometry)
     vertex_buf.setData(numpy_to_qbytearray(vertices))
 
-    pos_attr = Qt3DCore.QAttribute(geometry)
-    pos_attr.setName(Qt3DCore.QAttribute.defaultPositionAttributeName())
-    pos_attr.setVertexBaseType(Qt3DCore.QAttribute.VertexBaseType.Float)
-    pos_attr.setVertexSize(3)
-    pos_attr.setAttributeType(Qt3DCore.QAttribute.AttributeType.VertexAttribute)
-    pos_attr.setBuffer(vertex_buf)
-    pos_attr.setByteStride(3 * 4)
-    pos_attr.setCount(len(vertices))
-    geometry.addAttribute(pos_attr)
+    _add_vertex_attribute(
+        geometry,
+        name=Qt3DCore.QAttribute.defaultPositionAttributeName(),
+        buffer=vertex_buf,
+        vertex_size=3,
+        count=len(vertices),
+    )
+
+    normal_buf = Qt3DCore.QBuffer(geometry)
+    normal_buf.setData(numpy_to_qbytearray(_triangle_vertex_normals(vertices, indices)))
+    _add_vertex_attribute(
+        geometry,
+        name=Qt3DCore.QAttribute.defaultNormalAttributeName(),
+        buffer=normal_buf,
+        vertex_size=3,
+        count=len(vertices),
+    )
 
     index_buf = Qt3DCore.QBuffer(geometry)
     index_buf.setData(QByteArray(all_indices.tobytes()))
