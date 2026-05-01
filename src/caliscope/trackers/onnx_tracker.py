@@ -22,6 +22,42 @@ from caliscope.trackers.model_decode import decode_heatmap, decode_simcc
 logger = logging.getLogger(__name__)
 
 
+def _select_execution_providers(available_providers: list[str] | tuple[str, ...] | None = None) -> list[str]:
+    """Choose ONNX Runtime execution providers, preferring CUDA when available."""
+    if available_providers is None:
+        available_providers = ort.get_available_providers()
+
+    providers: list[str] = []
+    if "CUDAExecutionProvider" in available_providers:
+        providers.append("CUDAExecutionProvider")
+
+    if "CPUExecutionProvider" in available_providers:
+        providers.append("CPUExecutionProvider")
+
+    if not providers:
+        # Let ONNX Runtime raise its own provider-specific error if this unusual
+        # environment has neither CUDA nor CPU exposed.
+        return list(available_providers)
+
+    return providers
+
+
+def execution_provider_summary(providers: list[str] | tuple[str, ...]) -> str:
+    """Return a concise provider label for UI/status messages."""
+    if "CUDAExecutionProvider" in providers:
+        return "CUDA"
+    if "CPUExecutionProvider" in providers:
+        return "CPU"
+    if providers:
+        return providers[0].replace("ExecutionProvider", "")
+    return "Unknown"
+
+
+def available_execution_provider_summary() -> str:
+    """Return the provider Caliscope will prefer for ONNX tracking."""
+    return execution_provider_summary(_select_execution_providers())
+
+
 class OnnxTracker(Tracker):
     """Generic ONNX pose tracker configured via ModelCard.
 
@@ -29,11 +65,14 @@ class OnnxTracker(Tracker):
     First tracker to populate PointPacket.confidence field.
     """
 
-    def __init__(self, card: ModelCard) -> None:
+    def __init__(self, card: ModelCard, execution_providers: list[str] | tuple[str, ...] | None = None) -> None:
         """Create inference session from model card.
 
         Args:
             card: Model configuration and metadata
+            execution_providers: Optional ONNX Runtime provider chain. When
+                omitted, CUDA is preferred when available and CPU is used as a
+                fallback.
 
         Raises:
             FileNotFoundError: If ONNX model file doesn't exist
@@ -44,12 +83,16 @@ class OnnxTracker(Tracker):
         if not card.onnx_exists:
             raise FileNotFoundError(f"ONNX model not found: {card.model_path}")
 
-        # Create onnxruntime session (CPU only)
+        # Create onnxruntime session. Prefer CUDA when onnxruntime-gpu exposes it,
+        # with CPU as a fallback for unsupported ops or CPU-only installations.
+        providers = list(execution_providers) if execution_providers is not None else _select_execution_providers()
         logger.info(f"Loading ONNX model: {card.model_path}")
+        logger.info(f"ONNX Runtime execution providers: {providers}")
         self.session = ort.InferenceSession(
             str(card.model_path),
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
+        self.execution_providers = self.session.get_providers()
 
         # Get input name from model
         self.input_name = self.session.get_inputs()[0].name
@@ -61,7 +104,8 @@ class OnnxTracker(Tracker):
 
         logger.info(
             f"OnnxTracker initialized: {card.name}, "
-            f"format={card.format}, input_size={card.input_width}x{card.input_height}"
+            f"format={card.format}, input_size={card.input_width}x{card.input_height}, "
+            f"providers={self.execution_providers}"
         )
 
     @property

@@ -98,6 +98,19 @@ def has_source_url(key: str) -> bool:
     return card.has_source_url
 
 
+def onnx_execution_provider_for(key: str) -> str | None:
+    """Return the preferred ONNX execution provider summary for a tracker.
+
+    Returns None for non-ONNX/built-in trackers.
+    """
+    if key not in _model_cards:
+        return None
+
+    from caliscope.trackers.onnx_tracker import available_execution_provider_summary
+
+    return available_execution_provider_summary()
+
+
 def scan_onnx_models(models_dir: Path) -> None:
     """Scan directory for .toml model cards and register each as ONNX tracker.
 

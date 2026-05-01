@@ -319,11 +319,23 @@ Other RTMPose variants and SLEAP-exported models should work with appropriate mo
 
 ## Performance Characteristics
 
-ONNX trackers in Caliscope use CPU inference through onnxruntime. Processing speed depends on:
+ONNX trackers in Caliscope use ONNX Runtime inference. When the installed ONNX Runtime package exposes `CUDAExecutionProvider`, Caliscope prefers CUDA and keeps `CPUExecutionProvider` as a fallback. Standard `onnxruntime` installs expose CPU only; CUDA acceleration requires installing a GPU-enabled ONNX Runtime build that matches your CUDA/cuDNN stack.
+
+You can check what your environment exposes:
+
+```python
+import onnxruntime as ort
+print(ort.get_available_providers())
+```
+
+If the list contains `CUDAExecutionProvider`, Caliscope will use it automatically for ONNX tracking.
+
+Processing speed depends on:
 
 - **Model size:** Smaller models (RTMPose-t) process faster than larger ones (RTMPose-m)
 - **Input resolution:** Models with smaller input sizes process faster
-- **CPU capabilities:** More cores and newer processors improve throughput
+- **Execution provider:** CUDA-capable ONNX Runtime builds can run inference on NVIDIA GPUs; CPU-only builds use processor cores
+- **Hardware capabilities:** GPU memory/compute capability or CPU cores and vector instructions affect throughput
 
 A three-tier crop-and-track strategy helps maintain robust detection across frames:
 
@@ -335,4 +347,4 @@ This ensures reliable detection even when subjects move rapidly or temporarily l
 
 ## Limitations
 
-The ONNX tracker currently supports single-person detection with CPU inference only. GPU acceleration and multi-person tracking are not yet implemented. If you have a use case that requires these features, please [open an issue](https://github.com/mprib/caliscope/issues).
+The ONNX tracker currently supports single-person detection. Multi-person tracking is not yet implemented. If you have a use case that requires this feature, please [open an issue](https://github.com/mprib/caliscope/issues).

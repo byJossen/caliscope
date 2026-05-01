@@ -24,6 +24,7 @@ from caliscope.task_manager.task_handle import TaskHandle
 from caliscope.task_manager.task_manager import TaskManager
 from caliscope.task_manager.task_state import TaskState
 from caliscope.trackers import tracker_registry
+from caliscope.trackers.onnx_tracker import execution_provider_summary
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,10 @@ class ReconstructionPresenter(QObject):
 
         def worker(token, handle):
             reconstructor = Reconstructor(camera_array, recording_path, tracker_name)
+            providers = getattr(reconstructor.tracker, "execution_providers", None)
+            if providers:
+                provider = execution_provider_summary(providers)
+                handle.report_progress(0, f"Stage 1: Detecting 2D landmarks using {provider}")
 
             # Stage 1: 2D landmark detection (0-80%)
             if not reconstructor.create_xy(token=token, handle=handle):

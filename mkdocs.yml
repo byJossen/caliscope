@@ -30,7 +30,9 @@ theme:
 
 nav:
   - Home: index.md
-  - Installation: installation.md
+  - Installation:
+      - Standard Install: installation.md
+      - CUDA Install: cuda_installation.md
   - Getting Started:
       - Project Setup: project_setup.md
       - Sample Project: sample_project.md

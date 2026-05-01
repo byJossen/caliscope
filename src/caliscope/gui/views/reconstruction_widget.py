@@ -101,6 +101,11 @@ class ReconstructionWidget(QWidget):
         self._tracker_combo = QComboBox()
         tracker_layout.addWidget(self._tracker_combo)
 
+        self._inference_provider_label = QLabel("Inference: select an ONNX tracker")
+        self._inference_provider_label.setStyleSheet("font-size: 11px; color: #888;")
+        self._inference_provider_label.setWordWrap(True)
+        tracker_layout.addWidget(self._inference_provider_label)
+
         self._models_folder_link = QLabel(
             f'<a href="file://{MODELS_DIR}" style="color: {Colors.PRIMARY};">Open Models Folder</a>'
         )
@@ -224,6 +229,7 @@ class ReconstructionWidget(QWidget):
         if index >= 0:
             tracker_name = self._tracker_combo.itemData(index)
             self._presenter.select_tracker(tracker_name)
+            self._update_inference_provider_label()
             self._update_visualization()
 
     def _on_process_clicked(self) -> None:
@@ -293,6 +299,7 @@ class ReconstructionWidget(QWidget):
         """
         # State label
         self._state_label.setText(f"State: {state.name}")
+        self._update_inference_provider_label()
 
         # State-specific styling
         if state == ReconstructionState.COMPLETE:
@@ -468,6 +475,33 @@ class ReconstructionWidget(QWidget):
 
         # Update button text and status message to reflect new readiness state
         self._update_ui_for_state(self._presenter.state)
+
+    def _update_inference_provider_label(self) -> None:
+        """Show the ONNX Runtime provider the selected tracker will use."""
+        tracker = self._presenter.selected_tracker
+        if tracker is None:
+            self._inference_provider_label.setText("Inference: select an ONNX tracker")
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #888;")
+            return
+
+        provider = tracker_registry.onnx_execution_provider_for(tracker)
+        if provider is None:
+            self._inference_provider_label.setText("Inference: built-in tracker")
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #888;")
+            return
+
+        if not tracker_registry.is_model_ready(tracker):
+            self._inference_provider_label.setText(f"Inference: {provider} available after model download")
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #888;")
+            return
+
+        self._inference_provider_label.setText(f"Inference: {provider}")
+        if provider == "CUDA":
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #4CAF50; font-weight: bold;")
+        elif provider == "CPU":
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #B26A00; font-weight: bold;")
+        else:
+            self._inference_provider_label.setStyleSheet("font-size: 11px; color: #888;")
 
     def _on_open_models_folder(self, link: str) -> None:
         """Open MODELS_DIR in the system file manager."""

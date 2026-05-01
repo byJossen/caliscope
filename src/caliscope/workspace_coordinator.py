@@ -618,6 +618,32 @@ class WorkspaceCoordinator(QObject):
         self.push_camera_data(cam_id)
         logger.debug(f"Persisted camera rotation: cam_id {cam_id} -> {rotation_count * 90}°")
 
+    def persist_camera_fisheye(self, cam_id: int, enabled: bool) -> None:
+        """Persist the intrinsic lens model choice for a camera.
+
+        Called when the user toggles the fisheye checkbox in the intrinsic
+        calibration view. The presenter clears its in-memory calibration result
+        before emitting; this keeps the workspace's persisted camera state in
+        sync so the next calibration starts from the selected lens model.
+        """
+        if cam_id not in self.camera_array.cameras:
+            logger.warning(f"Cannot persist fisheye setting: cam_id {cam_id} not in camera_array")
+            return
+
+        camera = self.camera_array.cameras[cam_id]
+        camera.fisheye = bool(enabled)
+        camera.error = None
+        camera.matrix = None
+        camera.distortions = None
+        camera.grid_count = None
+        camera.translation = None
+        camera.rotation = None
+
+        self.camera_repository.save(self.camera_array)
+        self.push_camera_data(cam_id)
+        self.status_changed.emit()
+        logger.info(f"Persisted fisheye={enabled} for cam_id {cam_id}; cleared calibration data")
+
     def persist_intrinsic_calibration(
         self,
         output: IntrinsicCalibrationOutput,

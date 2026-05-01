@@ -3,11 +3,13 @@ from __future__ import annotations
 import faulthandler
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Write faulthandler trace to a file that survives the segfault
 # (pipe buffers don't flush on SIGSEGV)
-_faulthandler_file = open("/tmp/faulthandler.log", "w")  # noqa: SIM115
+_log_path = Path(tempfile.gettempdir()) / "caliscope_faulthandler.log"
+_faulthandler_file = open(_log_path, "w")  # noqa: SIM115
 faulthandler.enable(file=_faulthandler_file, all_threads=True)
 
 from caliscope import MODELS_DIR  # noqa: E402

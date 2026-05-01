@@ -97,6 +97,8 @@ Installation may take a moment as some dependencies are large.
 
 ONNX model inference via `onnxruntime` is included in both install targets. See [Custom ONNX Trackers](onnx_trackers.md) for details.
 
+For NVIDIA GPU acceleration during ONNX tracking, install a CUDA-enabled ONNX Runtime build in your environment. Caliscope automatically prefers `CUDAExecutionProvider` when ONNX Runtime exposes it and falls back to CPU otherwise.
+
 ## 5. Launch from the command line
 
 With the package installed and the virtual environment activated, the main GUI can be launched by running:
